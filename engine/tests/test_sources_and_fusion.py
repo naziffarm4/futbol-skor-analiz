@@ -33,6 +33,7 @@ from engine.scrapers.fusion import (
     compute_damped_first_half_share,
     cross_validate_injuries,
     cross_validate_match_scores,
+    fuse_team_metrics,
 )
 from engine.scrapers.injuries import InjuriesScraper
 from engine.scrapers.pipeline import IngestionPipeline
@@ -285,8 +286,11 @@ class SourceAdaptersUnitTests(unittest.TestCase):
                 fallback_team_shots={"Galatasaray": (16.0, 7.0, 9.0, 3.0)},
             )
         self.assertTrue(us_diag["ok"])
+        self.assertEqual(us_diag["source"], "ShotProxy-xG")
+        self.assertEqual(us_data.source_name, "ShotProxy-xG")
         gs_xg = us_data.teams["Galatasaray"]
         self.assertTrue(gs_xg.xg_is_derived)
+        self.assertEqual(gs_xg.source_name, "ShotProxy-xG")
         # 0.32 * 7 + 0.05 * (16 - 7) = 2.24 + 0.45 = 2.69
         self.assertAlmostEqual(gs_xg.xg_for_per_match, 2.69, places=2)
         xg_f, xg_a = derive_xg_from_shots(
@@ -542,7 +546,162 @@ class TeamAliasAndFusionTests(unittest.TestCase):
         self.assertEqual((updated[0].home_score, updated[0].away_score), (3, 1))
 
 
+    def test_super_lig_honest_xg_source_labels_fotmob_and_shot_proxy(self) -> None:
+        def tm_handler(req: httpx.Request) -> httpx.Response:
+            if "gesamtspielplan" in req.url.path:
+                return httpx.Response(200, text=MOCK_FIXTURES_HTML)
+            if "sperrenundverletzungen" in req.url.path:
+                return httpx.Response(200, text=MOCK_INJURIES_HTML)
+            return httpx.Response(404)
+
+        fotmob_next_data = json.dumps(
+            {
+                "props": {
+                    "pageProps": {
+                        "stats": {
+                            "seasonStatLinks": [
+                                {"Name": "2026/2027", "TournamentId": "9901"}
+                            ]
+                        }
+                    }
+                }
+            }
+        )
+        fotmob_html = f'<html><body><script id="__NEXT_DATA__">{fotmob_next_data}</script></body></html>'
+        fotmob_xg_json = {
+            "TopLists": [
+                {
+                    "StatList": [
+                        {"ParticipantName": "Galatasaray", "MatchesPlayed": 10, "StatValue": 21.5},
+                        {"ParticipantName": "Fenerbahçe", "MatchesPlayed": 10, "StatValue": 19.0},
+                    ]
+                }
+            ]
+        }
+        fotmob_xga_json = {
+            "TopLists": [
+                {
+                    "StatList": [
+                        {"ParticipantName": "Galatasaray", "MatchesPlayed": 10, "StatValue": 9.5},
+                        {"ParticipantName": "Fenerbahçe", "MatchesPlayed": 10, "StatValue": 10.0},
+                    ]
+                }
+            ]
+        }
+
+        def fotmob_bridge_handler(req: httpx.Request) -> httpx.Response:
+            url_s = str(req.url)
+            if "espn.com" in url_s and "scoreboard" in url_s:
+                return httpx.Response(200, json=MOCK_ESPN_SCOREBOARD)
+            if "espn.com" in url_s and "standings" in url_s:
+                return httpx.Response(200, json=MOCK_ESPN_STANDINGS)
+            if "football-data.co.uk" in url_s:
+                return httpx.Response(200, text=MOCK_FD_CSV)
+            if "sportsgambler.com" in url_s:
+                return httpx.Response(200, text=MOCK_SPORTSGAMBLER_HTML)
+            if "fotmob.com/leagues/" in url_s:
+                return httpx.Response(200, text=fotmob_html)
+            if "expected_goals_team.json" in url_s:
+                return httpx.Response(200, json=fotmob_xg_json)
+            if "expected_goals_conceded_team.json" in url_s:
+                return httpx.Response(200, json=fotmob_xga_json)
+            return httpx.Response(404)
+
+        with (
+            httpx.Client(base_url="https://mock.tm.local", transport=httpx.MockTransport(tm_handler)) as tm_c,
+            httpx.Client(transport=httpx.MockTransport(fotmob_bridge_handler)) as ext_c,
+        ):
+            base_http = BaseScraper(
+                base_url="https://mock.tm.local",
+                min_delay=0.0,
+                max_delay=0.0,
+                client=tm_c,
+            )
+            pipeline_bridge = IngestionPipeline(
+                http=base_http,
+                fixtures_scraper=FixturesScraper(base_http),
+                injuries_scraper=InjuriesScraper(base_http),
+                enable_multi_source=True,
+                espn_adapter=ESPNAdapter(client=ext_c),
+                football_data_adapter=FootballDataAdapter(client=ext_c, allow_mirror_fallback=False),
+                understat_adapter=UnderstatAdapter(client=ext_c, allow_opta_bridge=True),
+                secondary_adapter=SecondaryCheckAdapter(client=ext_c, allow_live_fallbacks=False),
+            )
+            res_bridge = pipeline_bridge.run_league(
+                LeagueId.SUPER_LIG,
+                reference_date=date(2026, 11, 25),
+                persist=False,
+            )
+
+        self.assertIn("FotMob-xG", res_bridge.sources_used)
+        self.assertNotIn("Understat", res_bridge.sources_used)
+        self.assertIn("FotMob-xG", res_bridge.source_diagnostics)
+        self.assertNotIn("Understat", res_bridge.source_diagnostics)
+        gs_bridge = next(t for t in res_bridge.teams if "Galatasaray" in t.name)
+        assert gs_bridge.id is not None
+        gs_bridge_m = res_bridge.team_metrics[gs_bridge.id]
+        self.assertEqual(gs_bridge_m.xg_source, "FotMob-xG")
+        self.assertFalse(gs_bridge_m.xg_is_derived)
+        self.assertIn("FotMob-xG", gs_bridge_m.sources_matched)
+        self.assertNotIn("Understat", gs_bridge_m.sources_matched)
+
+        # Opta köprüsü kapalıyken Süper Lig şut vekili -> ShotProxy-xG olmalı, Understat olmamalı
+        with (
+            httpx.Client(base_url="https://mock.tm.local", transport=httpx.MockTransport(tm_handler)) as tm_c2,
+            httpx.Client(transport=httpx.MockTransport(fotmob_bridge_handler)) as ext_c2,
+        ):
+            base_http2 = BaseScraper(
+                base_url="https://mock.tm.local",
+                min_delay=0.0,
+                max_delay=0.0,
+                client=tm_c2,
+            )
+            pipeline_proxy = IngestionPipeline(
+                http=base_http2,
+                fixtures_scraper=FixturesScraper(base_http2),
+                injuries_scraper=InjuriesScraper(base_http2),
+                enable_multi_source=True,
+                espn_adapter=ESPNAdapter(client=ext_c2),
+                football_data_adapter=FootballDataAdapter(client=ext_c2, allow_mirror_fallback=False),
+                understat_adapter=UnderstatAdapter(client=ext_c2, allow_opta_bridge=False),
+                secondary_adapter=SecondaryCheckAdapter(client=ext_c2, allow_live_fallbacks=False),
+            )
+            res_proxy = pipeline_proxy.run_league(
+                LeagueId.SUPER_LIG,
+                reference_date=date(2026, 11, 25),
+                persist=False,
+            )
+
+        self.assertIn("ShotProxy-xG", res_proxy.sources_used)
+        self.assertNotIn("Understat", res_proxy.sources_used)
+        self.assertIn("ShotProxy-xG", res_proxy.source_diagnostics)
+        self.assertNotIn("Understat", res_proxy.source_diagnostics)
+        gs_proxy = next(t for t in res_proxy.teams if "Galatasaray" in t.name)
+        assert gs_proxy.id is not None
+        gs_proxy_m = res_proxy.team_metrics[gs_proxy.id]
+        self.assertTrue(gs_proxy_m.xg_is_derived)
+        self.assertEqual(gs_proxy_m.xg_source, "ShotProxy-xG")
+        self.assertIn("ShotProxy-xG", gs_proxy_m.sources_matched)
+        self.assertNotIn("Understat", gs_proxy_m.sources_matched)
+
+        # Harici understat_data yokken doğrudan şutlardan türetilen xG vekili kontrolü
+        fd_parsed = parse_football_data_csv(MOCK_FD_CSV, LeagueId.SUPER_LIG, season_code="2627")
+        direct_fused = fuse_team_metrics(
+            [Team(id=1, league_id=LeagueId.SUPER_LIG, name="Galatasaray SK")],
+            football_data=fd_parsed,
+            understat_data=None,
+        )
+        self.assertTrue(direct_fused[1].xg_is_derived)
+        self.assertEqual(direct_fused[1].xg_source, "ShotProxy-xG")
+        self.assertIn("ShotProxy-xG", direct_fused[1].sources_matched)
+        self.assertNotIn("Understat", direct_fused[1].sources_matched)
+
+
 class LiveFiveSourcesSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(
+        os.getenv("RUN_LIVE_TESTS") == "1",
+        "Canlı ağ testi için RUN_LIVE_TESTS=1 gerekli",
+    )
     def test_live_all_five_sources_http_200_verification(self) -> None:
         """5 kaynağın tamamını canlı HTTP istekleriyle doğrular (ağ yoksa zarifçe atlar)."""
         try:

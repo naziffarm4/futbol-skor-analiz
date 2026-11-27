@@ -480,6 +480,7 @@ def build_bulletin_payload(
             if s not in merged_sources:
                 merged_sources.append(s)
     sources_used = merged_sources or ["Transfermarkt"]
+    root_sources_total = max(sources_total, len(sources_used), len(root_source_diagnostics))
 
     total_matches = sum(int(lg["matches_count"]) for lg in leagues_out)
     total_injuries = sum(int(lg["injuries_count"]) for lg in leagues_out)
@@ -490,7 +491,7 @@ def build_bulletin_payload(
         "data_source": _format_data_source_label(sources_used),
         "sources_used": sources_used,
         "sources_count": len(sources_used),
-        "sources_total": sources_total,
+        "sources_total": root_sources_total,
         "source_diagnostics": root_source_diagnostics,
         "generated_at": datetime.now(UTC).isoformat(),
         "season": season,

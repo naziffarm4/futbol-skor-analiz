@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import unittest
 from datetime import date
 from typing import Any
@@ -23,6 +24,7 @@ from engine.models.schemas import (
     Team,
 )
 from engine.scrapers.base import (
+    DEFAULT_USER_AGENT,
     BaseScraper,
     ScraperError,
     ScraperHTTPError,
@@ -247,9 +249,21 @@ MOCK_FIXTURES_HTML = """
 class BaseScraperTests(unittest.TestCase):
     def test_headers_and_helpers(self) -> None:
         headers = build_browser_headers()
-        self.assertIn("Mozilla/5.0", headers["User-Agent"])
+        self.assertEqual(
+            headers["User-Agent"],
+            "FutbolSkorAnaliz/1.0 (+https://github.com/naziffarm4/futbol-skor-analiz)",
+        )
+        self.assertEqual(headers["User-Agent"], DEFAULT_USER_AGENT)
+        self.assertNotIn("Mozilla/5.0", headers["User-Agent"])
         self.assertIn("Accept-Language", headers)
-        self.assertIn("Referer", headers)
+        self.assertNotIn("Referer", headers)
+        self.assertNotIn("DNT", headers)
+        self.assertNotIn("Upgrade-Insecure-Requests", headers)
+        self.assertNotIn("Sec-Ch-Ua", headers)
+
+        with_ref = build_browser_headers(referer="https://example.com/page")
+        self.assertEqual(with_ref["Referer"], "https://example.com/page")
+
         self.assertEqual(normalize_team_name("(1.)  Galatasaray SK "), "Galatasaray SK")
         with self.assertRaises(ScraperParseError):
             parse_html("   ")
@@ -629,6 +643,10 @@ class PipelineTests(unittest.TestCase):
 
 
 class LiveSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(
+        os.getenv("RUN_LIVE_TESTS") == "1",
+        "Canlı ağ testi için RUN_LIVE_TESTS=1 gerekli",
+    )
     def test_live_transfermarkt_super_lig_smoke(self) -> None:
         """Tek lig üzerinden canlı entegrasyon testi; ağ engeli durumunda zarifçe atlar."""
         try:

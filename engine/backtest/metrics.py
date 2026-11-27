@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from engine.models.schemas import ALL_HT_FT_CODES
+from engine.scrapers.sources.the_odds_api import DevigMethod, devig_power
 
 EPSILON = 1e-15
 
@@ -52,6 +54,10 @@ class MatchEvaluationRecord:
     actual_ht_ft: str | None = None
     ht_ft_probs: dict[str, float] | None = None
 
+    @property
+    def season(self) -> str:
+        return self.season_code
+
 
 @dataclass(slots=True)
 class CalibrationBucket:
@@ -94,6 +100,41 @@ class ModelSummaryMetrics:
     log_loss_ht_ft: float | None = None
     ht_ft_top1_accuracy: float | None = None
     ht_ft_top3_accuracy: float | None = None
+    ece_1x2: float = 0.0
+
+
+@dataclass(slots=True)
+class FavoriteSliceMetrics:
+    """Belirli bir favori olasılık dilimindeki ([0.6, 0.8) vb.) kalibrasyon ve doğruluk özeti."""
+
+    label: str
+    low: float
+    high: float
+    count: int
+    mean_predicted: float
+    empirical_rate: float
+    calibration_gap: float
+    abs_calibration_error: float
+    favorite_brier: float
+    brier_1x2: float
+    rps: float
+    log_loss_1x2: float
+
+
+@dataclass(slots=True)
+class PairedBootstrapResult:
+    """İki modelin aynı maçlar üzerindeki ΔRPS (yeni - baz) eşleştirilmiş bootstrap sonucu."""
+
+    candidate_name: str
+    baseline_name: str
+    paired_matches: int
+    mean_delta_rps: float
+    ci_low: float
+    ci_high: float
+    p_value_two_sided: float
+    significant_95: bool
+    n_boot: int = 1000
+    seed: int = 42
 
 
 MetricsSummary = ModelSummaryMetrics
@@ -194,25 +235,51 @@ def is_1x2_hit(
     return best_idx == actual_idx
 
 
-def devig_1x2_odds(odd_h: float, odd_d: float, odd_a: float) -> tuple[float, float, float]:
-    """Bahisçi marjını (overround) oransal yöntemle temizleyip 1X2 olasılıklarına çevirir."""
-    if odd_h <= 1.0 or odd_d <= 1.0 or odd_a <= 1.0:
+def devig_1x2_odds(
+    odd_h: float,
+    odd_d: float,
+    odd_a: float,
+    *,
+    method: DevigMethod = "power",
+) -> tuple[float, float, float]:
+    """Bahisçi marjını (overround) seçilen yöntemle (varsayılan: Power) temizleyip 1X2 olasılığına çevirir."""
+    if (
+        not (math.isfinite(odd_h) and math.isfinite(odd_d) and math.isfinite(odd_a))
+        or odd_h <= 1.0
+        or odd_d <= 1.0
+        or odd_a <= 1.0
+    ):
         raise ValueError("1X2 oranlarının tamamı 1.0'dan büyük olmalıdır.")
-    ih = 1.0 / odd_h
-    id_ = 1.0 / odd_d
-    ia = 1.0 / odd_a
-    overround = ih + id_ + ia
-    return (ih / overround, id_ / overround, ia / overround)
+    if method == "proportional":
+        ih = 1.0 / odd_h
+        id_ = 1.0 / odd_d
+        ia = 1.0 / odd_a
+        overround = ih + id_ + ia
+        return (ih / overround, id_ / overround, ia / overround)
+    p_h, p_d, p_a = devig_power((odd_h, odd_d, odd_a))
+    return (p_h, p_d, p_a)
 
 
-def devig_two_way_odds(odd_over: float, odd_under: float) -> tuple[float, float]:
-    """İki yönlü (Üst/Alt 2.5) oranlardan marjı oransal temizleyip (p_over, p_under) döndürür."""
-    if odd_over <= 1.0 or odd_under <= 1.0:
+def devig_two_way_odds(
+    odd_over: float,
+    odd_under: float,
+    *,
+    method: DevigMethod = "power",
+) -> tuple[float, float]:
+    """İki yönlü (Üst/Alt 2.5) oranlardan marjı (varsayılan: Power) temizleyip (p_over, p_under) döndürür."""
+    if (
+        not (math.isfinite(odd_over) and math.isfinite(odd_under))
+        or odd_over <= 1.0
+        or odd_under <= 1.0
+    ):
         raise ValueError("Üst/Alt oranlarının tamamı 1.0'dan büyük olmalıdır.")
-    io = 1.0 / odd_over
-    iu = 1.0 / odd_under
-    overround = io + iu
-    return (io / overround, iu / overround)
+    if method == "proportional":
+        io = 1.0 / odd_over
+        iu = 1.0 / odd_under
+        overround = io + iu
+        return (io / overround, iu / overround)
+    p_o, p_u = devig_power((odd_over, odd_under))
+    return (p_o, p_u)
 
 
 def _parse_positive_odd(row: Mapping[str, Any], key: str) -> float | None:
@@ -228,6 +295,8 @@ def _parse_positive_odd(row: Mapping[str, Any], key: str) -> float | None:
 
 def extract_market_1x2_probs(
     row: Mapping[str, Any],
+    *,
+    method: DevigMethod = "power",
 ) -> tuple[tuple[float, float, float] | None, str | None]:
     """CSV satırından öncelik sırasına göre (Kapanış -> Açılış) marjsız 1X2 olasılığı çıkarır."""
     for h_col, d_col, a_col, label in ODDS_1X2_PRIORITY:
@@ -235,7 +304,7 @@ def extract_market_1x2_probs(
         od = _parse_positive_odd(row, d_col)
         oa = _parse_positive_odd(row, a_col)
         if oh is not None and od is not None and oa is not None:
-            return devig_1x2_odds(oh, od, oa), label
+            return devig_1x2_odds(oh, od, oa, method=method), label
     return None, None
 
 
@@ -277,19 +346,25 @@ def ht_ft_top_k_hit(ht_ft_probs: Mapping[str, float], actual_code: str, k: int =
 
 def extract_market_over_under25_probs(
     row: Mapping[str, Any],
+    *,
+    method: DevigMethod = "power",
 ) -> tuple[tuple[float, float] | None, str | None]:
     """CSV satırından öncelik sırasına göre marjsız (Üst 2.5, Alt 2.5) olasılık ikilisini çıkarır."""
     for o_col, u_col, label in ODDS_OVER25_PRIORITY:
         oo = _parse_positive_odd(row, o_col)
         ou = _parse_positive_odd(row, u_col)
         if oo is not None and ou is not None:
-            return devig_two_way_odds(oo, ou), label
+            return devig_two_way_odds(oo, ou, method=method), label
     return None, None
 
 
-def extract_market_over25_prob(row: Mapping[str, Any]) -> tuple[float | None, str | None]:
+def extract_market_over25_prob(
+    row: Mapping[str, Any],
+    *,
+    method: DevigMethod = "power",
+) -> tuple[float | None, str | None]:
     """CSV satırından öncelik sırasına göre marjsız Üst 2.5 olasılığını çıkarır."""
-    pair, label = extract_market_over_under25_probs(row)
+    pair, label = extract_market_over_under25_probs(row, method=method)
     if pair is None:
         return None, None
     return pair[0], label
@@ -442,6 +517,7 @@ def summarize_records(
 
     mean_act_h = act_h_sum / n
     mean_act_a = act_a_sum / n
+    ece_val = compute_ece(compute_calibration_buckets(records, target="1x2"))
 
     return ModelSummaryMetrics(
         model_name=model_name,
@@ -468,6 +544,7 @@ def summarize_records(
         log_loss_ht_ft=round(ht_ft_ll, 5) if ht_ft_ll is not None else None,
         ht_ft_top1_accuracy=round(ht_ft_t1, 5) if ht_ft_t1 is not None else None,
         ht_ft_top3_accuracy=round(ht_ft_t3, 5) if ht_ft_t3 is not None else None,
+        ece_1x2=ece_val,
     )
 
 
@@ -532,3 +609,171 @@ def compute_calibration_buckets(
             )
         )
     return buckets
+
+
+def compute_ece(buckets: Sequence[CalibrationBucket]) -> float:
+    """Kalibrasyon dilimlerinden ağırlıklı Beklenen Kalibrasyon Hatasını (ECE) hesaplar."""
+    total = sum(b.count for b in buckets)
+    if total <= 0:
+        return 0.0
+    weighted_err = sum(
+        b.count * abs(b.mean_predicted - b.empirical_rate) for b in buckets
+    )
+    return round(weighted_err / total, 5)
+
+
+def evaluate_favorite_slice(
+    records: Sequence[MatchEvaluationRecord],
+    *,
+    low: float = 0.6,
+    high: float = 0.8,
+) -> FavoriteSliceMetrics:
+    """1X2 tahminlerinde favori olasılığı [low, high) dilimine düşen maçların kalibrasyonunu ölçer."""
+    label = f"[{low:.1f}, {high:.1f})"
+    selected: list[tuple[MatchEvaluationRecord, float, int]] = []
+    for rec in records:
+        probs = _normalize_triplet(rec.p_home, rec.p_draw, rec.p_away)
+        outcomes = outcome_one_hot(rec.home_goals, rec.away_goals)
+        for p_val, y_val in zip(probs, outcomes, strict=True):
+            if low <= p_val < high:
+                selected.append((rec, p_val, y_val))
+
+    cnt = len(selected)
+    if cnt == 0:
+        return FavoriteSliceMetrics(
+            label=label,
+            low=low,
+            high=high,
+            count=0,
+            mean_predicted=0.0,
+            empirical_rate=0.0,
+            calibration_gap=0.0,
+            abs_calibration_error=0.0,
+            favorite_brier=0.0,
+            brier_1x2=0.0,
+            rps=0.0,
+            log_loss_1x2=0.0,
+        )
+
+    mean_p = sum(p for _, p, _ in selected) / cnt
+    emp_r = sum(y for _, _, y in selected) / cnt
+    gap = mean_p - emp_r
+    fav_brier = sum((p - y) ** 2 for _, p, y in selected) / cnt
+    brier_3 = (
+        sum(
+            multiclass_brier_score(r.p_home, r.p_draw, r.p_away, r.home_goals, r.away_goals)
+            for r, _, _ in selected
+        )
+        / cnt
+    )
+    rps_val = (
+        sum(
+            ranked_probability_score(r.p_home, r.p_draw, r.p_away, r.home_goals, r.away_goals)
+            for r, _, _ in selected
+        )
+        / cnt
+    )
+    ll_val = (
+        sum(
+            multiclass_log_loss(r.p_home, r.p_draw, r.p_away, r.home_goals, r.away_goals)
+            for r, _, _ in selected
+        )
+        / cnt
+    )
+    return FavoriteSliceMetrics(
+        label=label,
+        low=low,
+        high=high,
+        count=cnt,
+        mean_predicted=round(mean_p, 5),
+        empirical_rate=round(emp_r, 5),
+        calibration_gap=round(gap, 5),
+        abs_calibration_error=round(abs(gap), 5),
+        favorite_brier=round(fav_brier, 5),
+        brier_1x2=round(brier_3, 5),
+        rps=round(rps_val, 5),
+        log_loss_1x2=round(ll_val, 5),
+    )
+
+
+def _linear_percentile(sorted_vals: Sequence[float], q: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    pos = min(1.0, max(0.0, q)) * (len(sorted_vals) - 1)
+    lo = int(math.floor(pos))
+    hi = min(len(sorted_vals) - 1, lo + 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def paired_bootstrap_rps_diff(
+    candidate_records: Sequence[MatchEvaluationRecord],
+    baseline_records: Sequence[MatchEvaluationRecord],
+    *,
+    candidate_name: str = "Aday Model",
+    baseline_name: str = "Baz Model",
+    n_boot: int = 1000,
+    seed: int = 42,
+) -> PairedBootstrapResult:
+    """Aynı maçlar üzerinde ΔRPS = RPS(aday) - RPS(baz) için %95 eşleştirilmiş bootstrap CI üretir."""
+    if n_boot < 1:
+        raise ValueError("n_boot en az 1 olmalıdır.")
+
+    base_map = {
+        (r.league_code, r.season_code, r.match_date, r.home_team, r.away_team): r
+        for r in baseline_records
+    }
+    diffs: list[float] = []
+    for cand in candidate_records:
+        key = (cand.league_code, cand.season_code, cand.match_date, cand.home_team, cand.away_team)
+        base = base_map.get(key)
+        if base is None:
+            continue
+        rps_cand = ranked_probability_score(
+            cand.p_home, cand.p_draw, cand.p_away, cand.home_goals, cand.away_goals
+        )
+        rps_base = ranked_probability_score(
+            base.p_home, base.p_draw, base.p_away, base.home_goals, base.away_goals
+        )
+        diffs.append(rps_cand - rps_base)
+
+    m = len(diffs)
+    if m == 0:
+        return PairedBootstrapResult(
+            candidate_name=candidate_name,
+            baseline_name=baseline_name,
+            paired_matches=0,
+            mean_delta_rps=0.0,
+            ci_low=0.0,
+            ci_high=0.0,
+            p_value_two_sided=1.0,
+            significant_95=False,
+            n_boot=n_boot,
+            seed=seed,
+        )
+
+    mean_delta = sum(diffs) / m
+    rng = random.Random(seed)
+    boot_means = sorted(sum(rng.choices(diffs, k=m)) / m for _ in range(n_boot))
+    ci_low = _linear_percentile(boot_means, 0.025)
+    ci_high = _linear_percentile(boot_means, 0.975)
+
+    le_zero = sum(1 for v in boot_means if v <= 0.0) / n_boot
+    ge_zero = sum(1 for v in boot_means if v >= 0.0) / n_boot
+    p_val = min(1.0, 2.0 * min(le_zero, ge_zero))
+    sig = (ci_high < 0.0) or (ci_low > 0.0)
+
+    return PairedBootstrapResult(
+        candidate_name=candidate_name,
+        baseline_name=baseline_name,
+        paired_matches=m,
+        mean_delta_rps=round(mean_delta, 6),
+        ci_low=round(ci_low, 6),
+        ci_high=round(ci_high, 6),
+        p_value_two_sided=round(p_val, 4),
+        significant_95=sig,
+        n_boot=n_boot,
+        seed=seed,
+    )

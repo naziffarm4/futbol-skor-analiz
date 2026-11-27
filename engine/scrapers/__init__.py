@@ -1,6 +1,7 @@
 """Kamuya açık futbol fikstür, istatistik, xG ve sakatlık/ceza veri toplama modülleri."""
 
 from engine.scrapers.base import (
+    DEFAULT_USER_AGENT,
     BaseScraper,
     ScraperError,
     ScraperHTTPError,
@@ -51,6 +52,7 @@ from engine.scrapers.sources import (
 )
 
 __all__ = [
+    "DEFAULT_USER_AGENT",
     "TRANSFERMARKT_LEAGUES",
     "BaseScraper",
     "ESPNAdapter",

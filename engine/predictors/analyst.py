@@ -759,13 +759,32 @@ def _build_ht_ft_reasoning_text(
             f"deplasmanda {a_away_gpg:.2f} gol ortalamasıyla oynayan {away_name} yan yana konulduğunda"
         )
 
-    # 2) xG / xGA vs gerçek gol karşılaştırması (Understat veya isabetli şut türevli)
+    # 2) xG / xGA vs gerçek gol karşılaştırması (Understat, FotMob-xG veya ShotProxy-xG)
     if home_profile.xg_for_per_match is not None and away_profile.xg_for_per_match is not None:
-        xg_source_note = (
-            "isabetli şut kalitesinden türetilen xG modelinde"
-            if (home_profile.xg_is_derived or away_profile.xg_is_derived)
-            else "Understat beklenen gol verilerinde"
+        combined_sources = set(home_profile.sources_matched) | set(away_profile.sources_matched)
+        has_fotmob_xg = (
+            home_profile.xg_source == "FotMob-xG"
+            or away_profile.xg_source == "FotMob-xG"
+            or "FotMob-xG" in combined_sources
         )
+        has_understat_xg = (
+            home_profile.xg_source == "Understat"
+            or away_profile.xg_source == "Understat"
+            or "Understat" in combined_sources
+        )
+        if (
+            home_profile.xg_is_derived
+            or away_profile.xg_is_derived
+            or home_profile.xg_source == "ShotProxy-xG"
+            or away_profile.xg_source == "ShotProxy-xG"
+        ):
+            xg_source_note = "isabetli şut kalitesinden türetilen xG vekili (ShotProxy-xG) modelinde"
+        elif has_fotmob_xg and not has_understat_xg:
+            xg_source_note = "FotMob-xG beklenen gol verilerinde"
+        elif has_understat_xg:
+            xg_source_note = "Understat beklenen gol verilerinde"
+        else:
+            xg_source_note = "beklenen gol verilerinde"
         h_xga = (
             f" / {home_profile.xg_against_per_match:.2f} xGA"
             if home_profile.xg_against_per_match is not None

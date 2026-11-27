@@ -10,6 +10,7 @@ import 'package:http/testing.dart';
 import 'package:intl/date_symbol_data_local.dart';
 
 import 'package:futbol_skor_bulteni/config/constants.dart';
+import 'package:futbol_skor_bulteni/config/theme.dart';
 import 'package:futbol_skor_bulteni/main.dart';
 import 'package:futbol_skor_bulteni/models/analysis_model.dart';
 import 'package:futbol_skor_bulteni/models/injury_model.dart';
@@ -1279,6 +1280,153 @@ void main() {
           findsNothing,
         );
         expect(find.text('Canlı'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'Test 15: GÖREV-14 DataTransparencyBanner bayat bülten (>36 saat) turuncu uyarısı, <=36 saat gizliliği ve FotMob-xG / ShotProxy-xG kaynakları',
+      (WidgetTester tester) async {
+        tester.view.physicalSize = const Size(360, 800);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(() {
+          tester.view.resetPhysicalSize();
+          tester.view.resetDevicePixelRatio();
+        });
+
+        // Geçersiz/boş ISO-8601 güvenli ayrıştırma kontrolü
+        expect(BulletinData.parseGeneratedAt(null), isNull);
+        expect(BulletinData.parseGeneratedAt(''), isNull);
+        expect(BulletinData.parseGeneratedAt('gecersiz-tarih'), isNull);
+        final parsedUtc =
+            BulletinData.parseGeneratedAt('2026-11-26T21:00:00+03:00');
+        expect(parsedUtc, DateTime.utc(2026, 11, 26, 18, 0));
+
+        final fixedNow = DateTime.utc(2026, 11, 28, 18, 0);
+        const superLigSources = <String>[
+          'ESPN',
+          'API-Football',
+          'FotMob-xG',
+          'ShotProxy-xG',
+          'Transfermarkt',
+          'SportsGambler',
+        ];
+
+        // 1. Güncel bülten (4 saat önce <= 36 saat): uyarı gösterilmez
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.darkTheme,
+            home: Scaffold(
+              body: DataTransparencyBanner(
+                sourcesUsed: superLigSources,
+                sourcesCount: 5,
+                sourcesTotal: 5,
+                generatedAt: fixedNow.subtract(const Duration(hours: 4)),
+                now: fixedNow,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(
+          find.byKey(const ValueKey('stale_bulletin_warning')),
+          findsNothing,
+        );
+        expect(find.textContaining('Bülten güncel değil'), findsNothing);
+        expect(find.textContaining('FotMob-xG'), findsOneWidget);
+        expect(find.textContaining('ShotProxy-xG'), findsOneWidget);
+
+        // 2. Tam sınır (36 saat 0 dk) ve null generatedAt: uyarı gösterilmez
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.darkTheme,
+            home: Scaffold(
+              body: Column(
+                children: [
+                  DataTransparencyBanner(
+                    generatedAt: fixedNow.subtract(const Duration(hours: 36)),
+                    now: fixedNow,
+                  ),
+                  DataTransparencyBanner(
+                    generatedAt: null,
+                    now: fixedNow,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(find.textContaining('Bülten güncel değil'), findsNothing);
+
+        // 3. Bayat bülten (48 saat önce > 36 saat): turuncu kutu, ikon ve metin gösterilir
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.darkTheme,
+            home: Scaffold(
+              body: DataTransparencyBanner(
+                sourcesUsed: superLigSources,
+                sourcesCount: 5,
+                sourcesTotal: 5,
+                generatedAt: fixedNow.subtract(const Duration(hours: 48)),
+                now: fixedNow,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+
+        final warningBoxFinder = find.byKey(
+          const ValueKey('stale_bulletin_warning'),
+        );
+        expect(warningBoxFinder, findsOneWidget);
+        expect(
+          find.text('Bülten güncel değil (48 saat önce)'),
+          findsOneWidget,
+        );
+
+        final warningContainer = tester.widget<Container>(warningBoxFinder);
+        final boxDecoration = warningContainer.decoration! as BoxDecoration;
+        expect(
+          boxDecoration.border,
+          Border.all(color: AppColors.neonOrange.withValues(alpha: 0.45)),
+        );
+
+        final warningIcon = tester.widget<Icon>(
+          find.descendant(
+            of: warningBoxFinder,
+            matching: find.byIcon(Icons.warning_amber_rounded),
+          ),
+        );
+        expect(warningIcon.color, AppColors.neonOrange);
+
+        final warningText = tester.widget<Text>(
+          find.text('Bülten güncel değil (48 saat önce)'),
+        );
+        expect(warningText.style?.color, AppColors.neonOrange);
+
+        // 4. Sınır üstü (36 saat 1 dk > 36 saat): uyarı tetiklenir
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.darkTheme,
+            home: Scaffold(
+              body: DataTransparencyBanner(
+                generatedAt: fixedNow.subtract(
+                  const Duration(hours: 36, minutes: 1),
+                ),
+                now: fixedNow,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(
+          find.text('Bülten güncel değil (36 saat önce)'),
+          findsOneWidget,
+        );
       },
     );
   });

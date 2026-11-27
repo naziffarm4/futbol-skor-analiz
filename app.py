@@ -46,7 +46,7 @@ def _parse_float_env(name: str, default: float, *, allow_zero: bool = False) -> 
 
 
 def _is_scheduler_enabled() -> bool:
-    return os.getenv("SCHEDULER_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+    return os.getenv("SCHEDULER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def _daily_scheduler_loop(startup_delay: float, interval_seconds: float) -> None:

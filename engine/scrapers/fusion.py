@@ -389,6 +389,7 @@ class TeamMultiSourceMetrics:
     xg_for_per_match: float | None = None
     xg_against_per_match: float | None = None
     xg_is_derived: bool = False
+    xg_source: str | None = None
     shots_for_per_match: float | None = None
     shots_against_per_match: float | None = None
     sot_for_per_match: float | None = None
@@ -533,18 +534,23 @@ def fuse_team_metrics(
                 tm_metric.market_win_prob_avg = fd_stat.market_win_prob_avg
             _add_source(tm_metric, "Football-Data")
 
-    # 3. Understat gerçek xG / xGA ve eksik takımlar için şut tabanlı xG vekili
+    # 3. Gerçek xG / xGA (Understat veya FotMob-xG) ve eksik takımlar için şut tabanlı xG vekili
     if understat_data is not None:
+        default_xg_src = getattr(understat_data, "source_name", "") or "Understat"
         for raw_tname, ug in understat_data.teams.items():
             tm_metric = _lookup_metric(raw_tname)
             if tm_metric is None:
                 continue
+            ug_src = getattr(ug, "source_name", "") or default_xg_src
+            if ug.xg_is_derived:
+                ug_src = "ShotProxy-xG"
             tm_metric.xg_for_per_match = ug.xg_for_per_match
             tm_metric.xg_against_per_match = ug.xg_against_per_match
             tm_metric.xg_is_derived = ug.xg_is_derived
+            tm_metric.xg_source = ug_src
             if ug.matches_played > tm_metric.matches_sampled:
                 tm_metric.matches_sampled = ug.matches_played
-            _add_source(tm_metric, "Understat")
+            _add_source(tm_metric, ug_src)
 
     for tm_metric in by_id.values():
         if tm_metric.xg_for_per_match is None or tm_metric.xg_against_per_match is None:
@@ -554,12 +560,19 @@ def fuse_team_metrics(
                 shots_against_per_match=tm_metric.shots_against_per_match,
                 sot_against_per_match=tm_metric.sot_against_per_match,
             )
+            derived_applied = False
             if tm_metric.xg_for_per_match is None and xg_f is not None:
                 tm_metric.xg_for_per_match = xg_f
                 tm_metric.xg_is_derived = True
+                derived_applied = True
             if tm_metric.xg_against_per_match is None and xg_a is not None:
                 tm_metric.xg_against_per_match = xg_a
                 tm_metric.xg_is_derived = True
+                derived_applied = True
+            if derived_applied:
+                if not tm_metric.xg_source:
+                    tm_metric.xg_source = "ShotProxy-xG"
+                _add_source(tm_metric, "ShotProxy-xG")
 
     # 4. İkincil çapraz doğrulama kaynağı (SportsGambler / TheSportsDB)
     if secondary_data is not None:

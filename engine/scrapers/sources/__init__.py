@@ -58,9 +58,11 @@ from engine.scrapers.sources.secondary_check import (  # noqa: E402
     parse_sportsgambler_html,
 )
 from engine.scrapers.sources.the_odds_api import (  # noqa: E402
+    DevigMethod,
     MarketMatchOdds,
     TheOddsApiAdapter,
     TheOddsLeagueData,
+    devig_power,
     devig_three_way,
     devig_two_way,
     parse_the_odds_events,
@@ -80,6 +82,7 @@ __all__ = [
     "UNDERSTAT_LEAGUE_SLUGS",
     "ApiFootballAdapter",
     "ApiFootballLeagueData",
+    "DevigMethod",
     "ESPNAdapter",
     "ESPNFixtureRecord",
     "ESPNLeagueData",
@@ -100,6 +103,7 @@ __all__ = [
     "UnderstatLeagueData",
     "UnderstatTeamXG",
     "derive_xg_from_shots",
+    "devig_power",
     "devig_three_way",
     "devig_two_way",
     "make_source_diagnostic",

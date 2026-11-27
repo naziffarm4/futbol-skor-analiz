@@ -29,10 +29,34 @@ jobs:
           pip install -r engine/requirements.txt ruff mypy
 
       - name: Run Ruff linter
-        run: ruff check engine app.py
+        run: python -m ruff check engine app.py
 
       - name: Run Mypy type checker
-        run: mypy engine/bulletin.py engine/scrapers/pipeline.py app.py
+        run: python -m mypy engine app.py
 
       - name: Run Python unit tests
         run: python -m unittest discover -s engine/tests -v
+
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Flutter dependencies
+        working-directory: mobile
+        run: flutter pub get
+
+      - name: Analyze Flutter code
+        working-directory: mobile
+        run: flutter analyze
+
+      - name: Run Flutter tests
+        working-directory: mobile
+        run: flutter test

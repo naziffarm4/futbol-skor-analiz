@@ -154,6 +154,7 @@ class TeamRatingProfile:
     xg_for_per_match: float | None = None
     xg_against_per_match: float | None = None
     xg_is_derived: bool = False
+    xg_source: str | None = None
     shots_for_per_match: float | None = None
     shots_against_per_match: float | None = None
     sot_for_per_match: float | None = None
@@ -399,6 +400,9 @@ def _populate_external_metrics(profile: TeamRatingProfile, metric_obj: Any) -> N
     profile.xg_is_derived = bool(
         _metric_get(metric_obj, "xg_is_derived", "derived_xg", "is_xg_derived") or False
     )
+    raw_xg_src = _metric_get(metric_obj, "xg_source")
+    if isinstance(raw_xg_src, str) and raw_xg_src.strip():
+        profile.xg_source = raw_xg_src.strip()
 
     profile.shots_for_per_match = _opt_float(
         _metric_get(metric_obj, "shots_for_per_match", "shots_per_match", "hs_per_match")

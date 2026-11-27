@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -52,9 +53,68 @@ class TheOddsLeagueData:
     matches: list[MarketMatchOdds] = field(default_factory=list)
 
 
-def devig_three_way(odd_home: float, odd_draw: float, odd_away: float) -> tuple[float, float, float, float] | None:
+DevigMethod = Literal["power", "proportional"]
+
+
+def devig_power(
+    odds: Sequence[float],
+    *,
+    tol: float = 1e-12,
+    max_iter: int = 100,
+) -> tuple[float, ...]:
+    """Bahisçi marjını (overround) Power yöntemiyle arındırır: sum(q_i^k) = 1 (tol <= 1e-10)."""
+    if len(odds) < 2:
+        raise ValueError("Marj arındırma için en az 2 oran gereklidir.")
+    if any(not math.isfinite(o) or o <= 1.0 for o in odds):
+        raise ValueError("Oranların tamamı 1.0'dan büyük sonlu sayılar olmalıdır.")
+
+    qs = [1.0 / float(o) for o in odds]
+    overround = sum(qs)
+    if overround <= 1.0 + tol:
+        return tuple(q / overround for q in qs)
+
+    lo = 1.0
+    hi = 2.0
+    while sum(q**hi for q in qs) > 1.0 and hi < 1e6:
+        lo = hi
+        hi *= 2.0
+
+    k = 0.5 * (lo + hi)
+    for _ in range(max_iter):
+        qs_k = [q**k for q in qs]
+        f_val = sum(qs_k) - 1.0
+        if abs(f_val) <= tol or (hi - lo) <= tol:
+            break
+        if f_val > 0.0:
+            lo = k
+        else:
+            hi = k
+        df_val = sum(qk * math.log(q) for qk, q in zip(qs_k, qs, strict=True))
+        if df_val < -1e-15:
+            cand = k - f_val / df_val
+            k = cand if lo < cand < hi else 0.5 * (lo + hi)
+        else:
+            k = 0.5 * (lo + hi)
+
+    raw_probs = [q**k for q in qs]
+    tot = sum(raw_probs)
+    return tuple(p / tot for p in raw_probs)
+
+
+def devig_three_way(
+    odd_home: float,
+    odd_draw: float,
+    odd_away: float,
+    *,
+    method: DevigMethod = "power",
+) -> tuple[float, float, float, float] | None:
     """1X2 ondalık oranlarından bahisçi marjını (vig/overround) arındırır."""
-    if odd_home <= 1.0 or odd_draw <= 1.0 or odd_away <= 1.0:
+    if (
+        not (math.isfinite(odd_home) and math.isfinite(odd_draw) and math.isfinite(odd_away))
+        or odd_home <= 1.0
+        or odd_draw <= 1.0
+        or odd_away <= 1.0
+    ):
         return None
     q_h = 1.0 / odd_home
     q_d = 1.0 / odd_draw
@@ -62,22 +122,41 @@ def devig_three_way(odd_home: float, odd_draw: float, odd_away: float) -> tuple[
     overround = q_h + q_d + q_a
     if overround <= 0.0:
         return None
-    return q_h / overround, q_d / overround, q_a / overround, overround
+    if method == "proportional":
+        return q_h / overround, q_d / overround, q_a / overround, overround
+    p_h, p_d, p_a = devig_power((odd_home, odd_draw, odd_away))
+    return p_h, p_d, p_a, overround
 
 
-def devig_two_way(odd_over: float, odd_under: float) -> tuple[float, float] | None:
+def devig_two_way(
+    odd_over: float,
+    odd_under: float,
+    *,
+    method: DevigMethod = "power",
+) -> tuple[float, float] | None:
     """2 yönlü (Alt/Üst 2.5) ondalık oranlardan bahisçi marjını arındırır."""
-    if odd_over <= 1.0 or odd_under <= 1.0:
+    if (
+        not (math.isfinite(odd_over) and math.isfinite(odd_under))
+        or odd_over <= 1.0
+        or odd_under <= 1.0
+    ):
         return None
     q_o = 1.0 / odd_over
     q_u = 1.0 / odd_under
     total = q_o + q_u
     if total <= 0.0:
         return None
-    return q_o / total, q_u / total
+    if method == "proportional":
+        return q_o / total, q_u / total
+    p_o, p_u = devig_power((odd_over, odd_under))
+    return p_o, p_u
 
 
-def parse_the_odds_events(events: list[dict[str, Any]]) -> list[MarketMatchOdds]:
+def parse_the_odds_events(
+    events: list[dict[str, Any]],
+    *,
+    method: DevigMethod = "power",
+) -> list[MarketMatchOdds]:
     """The Odds API etkinlik listesinden konsensüs marjsız 1X2 ve 2.5 Alt/Üst olasılıklarını hesaplar."""
     results: list[MarketMatchOdds] = []
 
@@ -137,7 +216,7 @@ def parse_the_odds_events(events: list[dict[str, Any]]) -> list[MarketMatchOdds]
                             odd_d = price
 
                     if odd_h is not None and odd_d is not None and odd_a is not None:
-                        dv = devig_three_way(odd_h, odd_d, odd_a)
+                        dv = devig_three_way(odd_h, odd_d, odd_a, method=method)
                         if dv is not None:
                             h2h_samples.append((dv[0], dv[1], dv[2]))
                             overrounds.append(dv[3])
@@ -162,7 +241,7 @@ def parse_the_odds_events(events: list[dict[str, Any]]) -> list[MarketMatchOdds]
                             odd_under = price
 
                     if odd_over is not None and odd_under is not None:
-                        dv_tot = devig_two_way(odd_over, odd_under)
+                        dv_tot = devig_two_way(odd_over, odd_under, method=method)
                         if dv_tot is not None:
                             totals_samples.append(dv_tot)
 

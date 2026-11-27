@@ -2,8 +2,7 @@ name: Update Football Bulletin
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # TSİ 09:00 (06:00 UTC)
-    - cron: '0 16 * * *'  # TSİ 19:00 (16:00 UTC)
+    - cron: '0 7 * * *'   # TSİ 10:00 (07:00 UTC — ayda ~240/500 kredi güvenlik marjı)
   workflow_dispatch:
 
 permissions:
@@ -40,6 +39,16 @@ jobs:
           mkdir -p dist
           PAGES_JSON="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/bulletin.json"
           curl -fsSL --max-time 15 "$PAGES_JSON" -o dist/bulletin.json || rm -f dist/bulletin.json
+
+      - name: Restore and save API cache and quota budget
+        uses: actions/cache@v4
+        with:
+          path: |
+            engine/data/api_cache
+            engine/data/quota_budget.json
+          key: bulletin-api-quota-${{ github.run_id }}
+          restore-keys: |
+            bulletin-api-quota-
 
       - name: Export weekly football bulletin
         env:

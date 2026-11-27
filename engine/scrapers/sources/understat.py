@@ -40,6 +40,11 @@ _NEXT_DATA_RE = re.compile(
 )
 
 
+UNDERSTAT_SOURCE_NAME = "Understat"
+FOTMOB_XG_SOURCE_NAME = "FotMob-xG"
+SHOT_PROXY_XG_SOURCE_NAME = "ShotProxy-xG"
+
+
 @dataclass(frozen=True, slots=True)
 class UnderstatTeamXG:
     team_name: str
@@ -47,6 +52,7 @@ class UnderstatTeamXG:
     xg_for_per_match: float
     xg_against_per_match: float
     xg_is_derived: bool = False
+    source_name: str = UNDERSTAT_SOURCE_NAME
 
 
 @dataclass(slots=True)
@@ -54,6 +60,7 @@ class UnderstatLeagueData:
     league_id: LeagueId
     start_year: int
     teams: dict[str, UnderstatTeamXG] = field(default_factory=dict)
+    source_name: str = UNDERSTAT_SOURCE_NAME
 
 
 def derive_xg_from_shots(
@@ -142,6 +149,7 @@ def parse_understat_teams_data(raw_payload: dict[str, Any] | str) -> dict[str, U
                 xg_for_per_match=round(xg_sum / valid_rows, 3),
                 xg_against_per_match=round(xga_sum / valid_rows, 3),
                 xg_is_derived=False,
+                source_name=UNDERSTAT_SOURCE_NAME,
             )
     return parsed
 
@@ -149,7 +157,7 @@ def parse_understat_teams_data(raw_payload: dict[str, Any] | str) -> dict[str, U
 class UnderstatAdapter:
     """Understat xG/xGA birincil adaptörü; bakım veya Süper Lig durumunda canlı Opta/şut xG köprüsü."""
 
-    SOURCE_NAME = "Understat"
+    SOURCE_NAME = UNDERSTAT_SOURCE_NAME
 
     def __init__(
         self,
@@ -164,7 +172,6 @@ class UnderstatAdapter:
         )
         self._client = client or httpx.Client(
             headers=build_browser_headers(
-                referer="https://understat.com/",
                 accept_language="en-US,en;q=0.9",
             ),
             follow_redirects=True,
@@ -249,6 +256,7 @@ class UnderstatAdapter:
                 xg_for_per_match=xg_pm,
                 xg_against_per_match=xga_by_team.get(tname, 1.25),
                 xg_is_derived=False,
+                source_name=FOTMOB_XG_SOURCE_NAME,
             )
         return out, 200, xg_url
 
@@ -265,7 +273,7 @@ class UnderstatAdapter:
 
         slug = UNDERSTAT_LEAGUE_SLUGS.get(league_id)
         http_status: int | None = None
-        used_url = f"https://understat.com/league/{slug}/{start_year}" if slug else "https://understat.com/"
+        used_url = f"https://understat.com/league/{slug}/{start_year}" if slug else "https://www.fotmob.com/"
         notes: list[str] = []
         err_msg: str | None = None
 
@@ -286,8 +294,9 @@ class UnderstatAdapter:
                     parsed = parse_understat_teams_data(ajax_resp.text)
                     if parsed:
                         result.teams = parsed
+                        result.source_name = UNDERSTAT_SOURCE_NAME
                         return result, make_source_diagnostic(
-                            self.SOURCE_NAME,
+                            UNDERSTAT_SOURCE_NAME,
                             ok=True,
                             http_status=200,
                             records=len(parsed),
@@ -301,8 +310,9 @@ class UnderstatAdapter:
                     parsed = parse_understat_teams_data(page_resp.text)
                     if parsed:
                         result.teams = parsed
+                        result.source_name = UNDERSTAT_SOURCE_NAME
                         return result, make_source_diagnostic(
-                            self.SOURCE_NAME,
+                            UNDERSTAT_SOURCE_NAME,
                             ok=True,
                             http_status=200,
                             records=len(parsed),
@@ -326,9 +336,10 @@ class UnderstatAdapter:
                 )
                 if bridge_teams:
                     result.teams = bridge_teams
-                    notes.append(f"Opta xG/xGA köprüsü ({len(bridge_teams)} takım)")
+                    result.source_name = FOTMOB_XG_SOURCE_NAME
+                    notes.append(f"FotMob Opta xG/xGA köprüsü ({len(bridge_teams)} takım)")
                     return result, make_source_diagnostic(
-                        self.SOURCE_NAME,
+                        FOTMOB_XG_SOURCE_NAME,
                         ok=True,
                         http_status=st_code or 200,
                         records=len(bridge_teams),
@@ -354,12 +365,14 @@ class UnderstatAdapter:
                         xg_for_per_match=xg_f,
                         xg_against_per_match=xg_a,
                         xg_is_derived=True,
+                        source_name=SHOT_PROXY_XG_SOURCE_NAME,
                     )
             if derived:
                 result.teams = derived
+                result.source_name = SHOT_PROXY_XG_SOURCE_NAME
                 notes.append(f"İsabetli şut tabanlı türetilmiş xG ({len(derived)} takım)")
                 return result, make_source_diagnostic(
-                    self.SOURCE_NAME,
+                    SHOT_PROXY_XG_SOURCE_NAME,
                     ok=True,
                     http_status=http_status or 200,
                     records=len(derived),
@@ -367,8 +380,14 @@ class UnderstatAdapter:
                     note="; ".join(notes),
                 )
 
+        fail_source = (
+            UNDERSTAT_SOURCE_NAME
+            if slug is not None
+            else (FOTMOB_XG_SOURCE_NAME if self._allow_opta_bridge else SHOT_PROXY_XG_SOURCE_NAME)
+        )
+        result.source_name = fail_source
         return result, make_source_diagnostic(
-            self.SOURCE_NAME,
+            fail_source,
             ok=False,
             http_status=http_status,
             records=0,

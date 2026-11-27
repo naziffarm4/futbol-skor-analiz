@@ -12,7 +12,7 @@ Bu belge, tahmin ve bülten motorunun kullandığı resmi API'leri, açık veri 
 | **API-Football v3** (`v3.football.api-sports.io`) | Resmi REST API | Fikstür, ilk yarı / maç sonu skorları (`score.halftime` / `score.fulltime`), hafta numarası ve sakatlık/eksik kadro kayıtları | `x-apisports-key: <API_FOOTBALL_KEY>` | Günlük **100 istek**, dakikada **10 istek** (Ücretsiz planda sezon kapsamı kısıtı kontrol edilir) |
 | **ESPN Public Site API** (`site.api.espn.com`) | Açık JSON API | Canlı puan durumu, oynanmış maç skorları ve `leagues[0].calendar` tabanlı tekil `?dates=YYYYMMDD` takvim penceresi | Gerektirmez | Kibar HTTP istemcisi |
 | **Football-Data.co.uk & OpenFootball** | Açık CSV / JSON | Maç başı İY/MS golleri (`HTHG`, `HTAG`, `FTHG`, `FTAG`), şut, isabetli şut, korner, kart ve geçmiş piyasa kapanış oranları | Gerektirmez | Statik CSV/JSON |
-| **Understat & Şut Tabanlı xG Vekili** | Açık İstatistik | Takım bazlı beklenen gol (`xG` / `xGA`) metrikleri; kapsam dışı liglerde şut/isabetli şut kalibrasyonu | Gerektirmez | Kibar HTTP istemcisi |
+| **Understat / FotMob-xG / ShotProxy-xG** | Açık İstatistik & Vekil | Takım bazlı beklenen gol (`xG` / `xGA`) metrikleri; dürüst kaynak etiketlemesiyle gerçek Understat liglerinde `"Understat"`, Opta köprüsünde `"FotMob-xG"`, şut/isabetli şut kalibrasyonunda `"ShotProxy-xG"` olarak raporlanır | Gerektirmez | Kibar HTTP istemcisi |
 | **SportsGambler / TheSportsDB** | İkincil Çapraz Kaynak | Sakat ve cezalı oyuncu çapraz doğrulaması ve yedek puan durumu | Gerektirmez | Kibar HTTP istemcisi |
 | **Transfermarkt** (`transfermarkt.com.tr`) | Kibar HTTP İstemcisi | Yerel/erişilebilir ağlarda fikstür ve sakatlık verisi; veri merkezi IP'lerinde HTTP 202/403 döndüğünde tarayıcı taklidi yapılmaz, boru hattı kesintisiz olarak resmi API + ESPN + Football-Data yedeklerine geçer | Gerektirmez | `min_delay` / `max_delay` hız sınırlamalı `httpx` |
 
@@ -29,7 +29,7 @@ Bu belge, tahmin ve bülten motorunun kullandığı resmi API'leri, açık veri 
 
 ## 2. Kota Koruma ve Disk Önbellek Mimarisi (`QuotaBudgetTracker`)
 
-Ücretsiz plan kotalarının (özellikle The Odds API aylık 500 kredi ve API-Football günlük 100 istek sınırının) tekrarlı yerel çalışmalarda veya günde iki kez tetiklenen GitHub Actions iş akışlarında tükenmemesi için `QuotaBudgetTracker` devreye alınmıştır:
+Ücretsiz plan kotalarının (özellikle The Odds API aylık 500 kredi ve API-Football günlük 100 istek sınırının) tekrarlı yerel çalışmalarda veya GitHub Actions iş akışlarında tükenmemesi için `QuotaBudgetTracker` + `actions/cache@v4` kota kalkanı devreye alınmıştır (`.github/workflows/update_bulletin.yml` günde 1 kez `0 7 * * *` UTC zamanlamasıyla çalışır ve `engine/data/api_cache` ile `engine/data/quota_budget.json` dosyalarını `bulletin-api-quota-${{ github.run_id }}` / `restore-keys: bulletin-api-quota-` anahtarıyla çalışma öncesinde geri yükleyip iş sonunda günceller):
 
 1. **6 Saatlik Disk Önbelleği (`engine/data/api_cache/`):**
    - Her GET isteği `sha256(provider + endpoint + sıralı_gizli_olmayan_parametreler)` anahtarıyla diske yazılır.
@@ -47,8 +47,9 @@ Bu belge, tahmin ve bülten motorunun kullandığı resmi API'leri, açık veri 
 
 ## 3. Kullanım Koşulları ve Sıfır Bot/WAF Atlatma İlkesi
 
-`engine/scrapers/base.py` içerisindeki tüm başsız tarayıcı (Playwright) ve WAF atlatma mekanizmaları kalıcı olarak kaldırılmıştır:
-- `--disable-blink-features=AutomationControlled`, `HeadlessChrome/` User-Agent değiştirme ve `aws-waf-token` çerez yoklama döngüleri **kullanılmaz**.
+`engine/scrapers/base.py` ve `engine/requirements.txt` içerisindeki tüm başsız tarayıcı (`playwright`) ve WAF/bot taklidi mekanizmaları kalıcı olarak kaldırılmıştır:
+- `--disable-blink-features=AutomationControlled`, `HeadlessChrome/` veya sahte masaüstü Chrome/Firefox `User-Agent` rotasyonu ve `aws-waf-token` çerez yoklama döngüleri **kullanılmaz**.
+- Tüm HTTP istekleri projeyi açıkça tanıtan tekil dürüst `User-Agent` başlığıyla (`FutbolSkorAnaliz/1.0 (+https://github.com/naziffarm4/futbol-skor-analiz)`) gönderilir; varsayılan olarak ilgisiz sitelere `Referer` veya sahte `Sec-Ch-Ua` başlıkları eklenmez.
 - `BaseScraper` yalnızca hız sınırlamalı (`min_delay` / `max_delay`) ve geçici sunucu hatalarında (`429, 500, 502, 503, 504`) üstel geri çekilme (exponential backoff) uygulayan temiz bir `httpx.Client` sarmalayıcısıdır.
 - Bir kaynak HTTP `202` (WAF doğrulaması) veya `>= 400` döndürdüğünde başsız tarayıcı başlatılmaz; doğrudan `ScraperHTTPError` üretilir ve `IngestionPipeline` çoklu kaynak yedekleme katmanına geçer.
 

@@ -4,12 +4,15 @@ import '../config/constants.dart';
 import '../config/theme.dart';
 
 class DataTransparencyBanner extends StatelessWidget {
+  static const Duration staleThreshold = Duration(hours: 36);
+
   final String dataSource;
   final List<String> sourcesUsed;
   final int sourcesCount;
   final int sourcesTotal;
   final String? season;
   final DateTime? generatedAt;
+  final DateTime? now;
   final int playedMatchesCount;
   final int injuriesCount;
   final bool isCard;
@@ -22,6 +25,7 @@ class DataTransparencyBanner extends StatelessWidget {
     this.sourcesTotal = 5,
     this.season,
     this.generatedAt,
+    this.now,
     this.playedMatchesCount = 0,
     this.injuriesCount = 0,
     this.isCard = false,
@@ -43,6 +47,14 @@ class DataTransparencyBanner extends StatelessWidget {
         ? season!.trim()
         : AppConstants.defaultSeason;
     final formattedTime = AppConstants.formatShortTimestampTr(generatedAt);
+
+    final effectiveNow = (now ?? DateTime.now()).toUtc();
+    final generatedUtc = generatedAt?.toUtc();
+    final age =
+        generatedUtc != null ? effectiveNow.difference(generatedUtc) : null;
+    final String? staleWarningText = (age != null && age > staleThreshold)
+        ? 'Bülten güncel değil (${age.inHours} saat önce)'
+        : null;
 
     final sourcesLabel = cleanedSources.length > 1
         ? 'Kaynaklar: ${cleanedSources.join(', ')}'
@@ -69,6 +81,43 @@ class DataTransparencyBanner extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
+          if (staleWarningText != null) ...[
+            Container(
+              key: const ValueKey('stale_bulletin_warning'),
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: AppColors.neonOrange.withValues(alpha: 0.14),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: AppColors.neonOrange.withValues(alpha: 0.45),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.warning_amber_rounded,
+                    size: 15,
+                    color: AppColors.neonOrange,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      staleWarningText,
+                      softWrap: true,
+                      style: const TextStyle(
+                        color: AppColors.neonOrange,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                        height: 1.25,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
           Wrap(
             spacing: 6,
             runSpacing: 6,
@@ -130,6 +179,7 @@ class DataTransparencyBanner extends StatelessWidget {
           const SizedBox(height: 6),
           Text(
             sourcesLabel,
+            softWrap: true,
             style: const TextStyle(
               color: AppColors.textSecondary,
               fontSize: 11,

@@ -18,19 +18,8 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
-USER_AGENTS: tuple[str, ...] = (
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) "
-        "Gecko/20100101 Firefox/133.0"
-    ),
+DEFAULT_USER_AGENT: str = (
+    "FutbolSkorAnaliz/1.0 (+https://github.com/naziffarm4/futbol-skor-analiz)"
 )
 
 
@@ -53,24 +42,22 @@ class ScraperParseError(ScraperError):
 
 def build_browser_headers(
     *,
-    referer: str = "https://www.transfermarkt.com.tr/",
+    referer: str | None = None,
     accept_language: str = "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
     user_agent: str | None = None,
 ) -> dict[str, str]:
-    """Standart masaüstü HTTP istemci başlıkları üretir."""
-    ua = user_agent or random.choice(USER_AGENTS)
-    return {
-        "User-Agent": ua,
+    """Proje kimliğini açıkça bildiren dürüst HTTP istemci başlıkları üretir."""
+    headers: dict[str, str] = {
+        "User-Agent": user_agent or DEFAULT_USER_AGENT,
         "Accept": (
             "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "image/avif,image/webp,*/*;q=0.8"
+            "application/json;q=0.8,*/*;q=0.7"
         ),
         "Accept-Language": accept_language,
-        "Referer": referer,
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     }
+    if referer and referer.strip():
+        headers["Referer"] = referer.strip()
+    return headers
 
 
 def parse_html(html: str) -> BeautifulSoup:
@@ -135,7 +122,7 @@ class BaseScraper:
         self._owns_client = client is None
         self._client = client or httpx.Client(
             base_url=self.base_url,
-            headers=build_browser_headers(referer=f"{self.base_url}/"),
+            headers=build_browser_headers(),
             follow_redirects=True,
             timeout=timeout or settings.http_timeout_seconds,
         )
@@ -176,7 +163,7 @@ class BaseScraper:
                 response = self._client.get(
                     url_or_path,
                     params=params,
-                    headers={"User-Agent": random.choice(USER_AGENTS)},
+                    headers={"User-Agent": DEFAULT_USER_AGENT},
                 )
                 self._last_request_ts = time.monotonic()
             except httpx.HTTPError as exc:

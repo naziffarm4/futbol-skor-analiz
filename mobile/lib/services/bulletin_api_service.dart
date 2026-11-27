@@ -119,6 +119,12 @@ class BulletinData {
         .toList();
   }
 
+  static DateTime? parseGeneratedAt(dynamic raw) {
+    final text = raw?.toString().trim() ?? '';
+    if (text.isEmpty) return null;
+    return DateTime.tryParse(text)?.toUtc();
+  }
+
   factory BulletinData.fromJson(
     Map<String, dynamic> json, {
     bool isOfflineCache = false,
@@ -234,7 +240,7 @@ class BulletinData {
     final rootPlayed = _parseNonNegativeInt(rootPlayedRaw);
 
     return BulletinData(
-      generatedAt: DateTime.tryParse((json['generated_at'] ?? '').toString()),
+      generatedAt: parseGeneratedAt(json['generated_at']),
       season: effectiveSeason,
       dataSource: effectiveDataSource,
       sourcesUsed: parsedRootSources,

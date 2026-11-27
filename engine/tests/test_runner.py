@@ -240,39 +240,49 @@ class RunnerAndServiceTests(unittest.TestCase):
         self.assertIn("prediction", parsed_json)
 
     def test_fastapi_endpoints(self) -> None:
-        with TestClient(service_app.app) as client:
-            health_resp = client.get("/health")
-            self.assertEqual(health_resp.status_code, 200)
-            health_data = health_resp.json()
-            self.assertEqual(health_data["status"], "ok")
-            self.assertGreaterEqual(health_data["uptime"], 0.0)
-            self.assertTrue(health_data["scheduler_active"])
-            self.assertIn("bulletin_age_seconds", health_data)
-            self.assertIsNone(health_data["bulletin_age_seconds"])
+        env_without_sched = {k: v for k, v in os.environ.items() if k != "SCHEDULER_ENABLED"}
+        with patch.dict(os.environ, env_without_sched, clear=True):
+            with TestClient(service_app.app) as client:
+                health_resp = client.get("/health")
+                self.assertEqual(health_resp.status_code, 200)
+                health_data = health_resp.json()
+                self.assertEqual(health_data["status"], "ok")
+                self.assertGreaterEqual(health_data["uptime"], 0.0)
+                self.assertFalse(health_data["scheduler_active"])
+                self.assertIn("bulletin_age_seconds", health_data)
+                self.assertIsNone(health_data["bulletin_age_seconds"])
 
-            status_resp = client.get("/status")
-            self.assertEqual(status_resp.status_code, 200)
-            status_data = status_resp.json()
-            self.assertIn("is_running", status_data)
-            self.assertIn("leagues", status_data)
-            self.assertEqual(
-                set(status_data["leagues"].keys()),
-                {"super_lig", "premier_league", "la_liga", "ligue_1"},
-            )
+                status_resp = client.get("/status")
+                self.assertEqual(status_resp.status_code, 200)
+                status_data = status_resp.json()
+                self.assertIn("is_running", status_data)
+                self.assertIn("leagues", status_data)
+                self.assertEqual(
+                    set(status_data["leagues"].keys()),
+                    {"super_lig", "premier_league", "la_liga", "ligue_1"},
+                )
 
-            root_json_resp = client.get("/")
-            self.assertEqual(root_json_resp.status_code, 200)
-            root_data = root_json_resp.json()
-            self.assertEqual(root_data["service"], "Futbol Skor ve Analiz Motoru")
-            self.assertIn("status", root_data)
-            self.assertIn("uptime", root_data)
-            self.assertEqual(len(root_data["leagues"]), 4)
+                root_json_resp = client.get("/")
+                self.assertEqual(root_json_resp.status_code, 200)
+                root_data = root_json_resp.json()
+                self.assertEqual(root_data["service"], "Futbol Skor ve Analiz Motoru")
+                self.assertIn("status", root_data)
+                self.assertIn("uptime", root_data)
+                self.assertEqual(len(root_data["leagues"]), 4)
 
-            root_html_resp = client.get("/", headers={"Accept": "text/html"})
-            self.assertEqual(root_html_resp.status_code, 200)
-            self.assertIn("text/html", root_html_resp.headers["content-type"])
-            self.assertIn("Futbol Skor ve Analiz Motoru", root_html_resp.text)
-            self.assertIn("Süper Lig", root_html_resp.text)
+                root_html_resp = client.get("/", headers={"Accept": "text/html"})
+                self.assertEqual(root_html_resp.status_code, 200)
+                self.assertIn("text/html", root_html_resp.headers["content-type"])
+                self.assertIn("Futbol Skor ve Analiz Motoru", root_html_resp.text)
+                self.assertIn("Süper Lig", root_html_resp.text)
+
+        with patch.dict(
+            os.environ,
+            {"SCHEDULER_ENABLED": "true", "STARTUP_SYNC_DELAY_SECONDS": "60"},
+            clear=False,
+        ):
+            with TestClient(service_app.app) as enabled_client:
+                self.assertTrue(enabled_client.get("/health").json()["scheduler_active"])
 
     def test_fastapi_sync_endpoint_and_conflict(self) -> None:
         mock_pipeline = MagicMock()

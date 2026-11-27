@@ -66,6 +66,8 @@ CANONICAL_SOURCE_ORDER: tuple[str, ...] = (
     "ESPN",
     "Football-Data",
     "Understat",
+    "FotMob-xG",
+    "ShotProxy-xG",
     "Transfermarkt",
     "SportsGambler",
     "TheSportsDB",
@@ -972,13 +974,21 @@ class IngestionPipeline:
                         season=active_season,
                         fallback_team_shots=fallback_shots or None,
                     )
-                    source_diagnostics["Understat"] = us_diag
+                    xg_src_name = str(
+                        us_diag.get("source")
+                        or getattr(understat_data, "source_name", "")
+                        or "Understat"
+                    )
+                    source_diagnostics[xg_src_name] = us_diag
                     if us_diag.get("ok"):
-                        sources_used.append("Understat")
+                        sources_used.append(xg_src_name)
                 except Exception as exc:
-                    logger.warning("Understat yürütme hatası (%s): %s", league_id.value, exc)
-                    source_diagnostics["Understat"] = make_source_diagnostic(
-                        "Understat", ok=False, error=str(exc)
+                    logger.warning("xG kaynağı yürütme hatası (%s): %s", league_id.value, exc)
+                    fallback_diag_name = (
+                        "FotMob-xG" if league_id == LeagueId.SUPER_LIG else "Understat"
+                    )
+                    source_diagnostics[fallback_diag_name] = make_source_diagnostic(
+                        fallback_diag_name, ok=False, error=str(exc)
                     )
 
         tm_had_data = bool(fixtures_data.matches or scraped_injuries)
