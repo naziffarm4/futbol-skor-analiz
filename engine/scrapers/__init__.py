@@ -1,0 +1,91 @@
+"""Kamuya açık futbol fikstür, istatistik, xG ve sakatlık/ceza veri toplama modülleri."""
+
+from engine.scrapers.base import (
+    BaseScraper,
+    ScraperError,
+    ScraperHTTPError,
+    ScraperParseError,
+    build_browser_headers,
+    clean_text,
+    normalize_team_name,
+    parse_html,
+)
+from engine.scrapers.fixtures import (
+    FixturesScraper,
+    LeagueFixturesData,
+    ScrapedMatch,
+    ScrapedTeam,
+    parse_fixtures_html,
+)
+from engine.scrapers.fusion import (
+    TeamAliasResolver,
+    TeamMultiSourceMetrics,
+    compute_damped_first_half_share,
+    cross_validate_injuries,
+    cross_validate_match_scores,
+    fuse_team_metrics,
+)
+from engine.scrapers.injuries import (
+    TRANSFERMARKT_LEAGUES,
+    InjuriesScraper,
+    ScrapedInjury,
+    TransfermarktLeagueRoute,
+    calculate_impact_level,
+    map_player_position,
+    parse_injuries_html,
+    parse_return_date,
+)
+from engine.scrapers.pipeline import (
+    IngestionPipeline,
+    LeaguePipelineResult,
+    PipelineResult,
+    run_ingestion_pipeline,
+)
+from engine.scrapers.sources import (
+    ESPNAdapter,
+    FootballDataAdapter,
+    SecondaryCheckAdapter,
+    UnderstatAdapter,
+    derive_xg_from_shots,
+    make_source_diagnostic,
+)
+
+__all__ = [
+    "TRANSFERMARKT_LEAGUES",
+    "BaseScraper",
+    "ESPNAdapter",
+    "FixturesScraper",
+    "FootballDataAdapter",
+    "IngestionPipeline",
+    "InjuriesScraper",
+    "LeagueFixturesData",
+    "LeaguePipelineResult",
+    "PipelineResult",
+    "ScrapedInjury",
+    "ScrapedMatch",
+    "ScrapedTeam",
+    "ScraperError",
+    "ScraperHTTPError",
+    "ScraperParseError",
+    "SecondaryCheckAdapter",
+    "TeamAliasResolver",
+    "TeamMultiSourceMetrics",
+    "TransfermarktLeagueRoute",
+    "UnderstatAdapter",
+    "build_browser_headers",
+    "calculate_impact_level",
+    "clean_text",
+    "compute_damped_first_half_share",
+    "cross_validate_injuries",
+    "cross_validate_match_scores",
+    "derive_xg_from_shots",
+    "fuse_team_metrics",
+    "make_source_diagnostic",
+    "map_player_position",
+    "normalize_team_name",
+    "parse_fixtures_html",
+    "parse_html",
+    "parse_injuries_html",
+    "parse_return_date",
+    "run_ingestion_pipeline",
+]

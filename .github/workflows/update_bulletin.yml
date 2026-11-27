@@ -1,0 +1,174 @@
+name: Update Football Bulletin
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # TSİ 09:00 (06:00 UTC)
+    - cron: '0 16 * * *'  # TSİ 19:00 (16:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'engine/requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          pip install -r engine/requirements.txt
+          command -v google-chrome >/dev/null 2>&1 || python -m playwright install --with-deps chromium
+
+      - name: Seed previous bulletin from GitHub Pages
+        run: |
+          mkdir -p dist
+          PAGES_JSON="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/bulletin.json"
+          curl -fsSL --max-time 15 "$PAGES_JSON" -o dist/bulletin.json || rm -f dist/bulletin.json
+
+      - name: Export weekly football bulletin
+        run: |
+          if command -v xvfb-run >/dev/null 2>&1; then
+            SCRAPER_HEADED=1 xvfb-run -a python -m engine.cli --export-bulletin dist/bulletin.json
+          else
+            python -m engine.cli --export-bulletin dist/bulletin.json
+          fi
+
+      - name: Validate bulletin.json and generate static Pages site
+        run: |
+          python - <<'PY'
+          import html
+          import json
+          from pathlib import Path
+
+          dist_dir = Path("dist")
+          bulletin_path = dist_dir / "bulletin.json"
+          if not bulletin_path.is_file():
+              raise SystemExit("HATA: dist/bulletin.json bulunamadi.")
+
+          data = json.loads(bulletin_path.read_text(encoding="utf-8"))
+          required_keys = {
+              "data_source",
+              "sources_used",
+              "sources_count",
+              "sources_total",
+              "generated_at",
+              "total_played_matches",
+              "leagues_meta",
+              "leagues",
+          }
+          missing = required_keys - data.keys()
+          if missing:
+              raise SystemExit(f"HATA: Eksik bulten alanlari: {sorted(missing)}")
+
+          leagues = data.get("leagues")
+          total_matches = int(data.get("total_matches", 0))
+          if not isinstance(leagues, list) or len(leagues) != 4:
+              raise SystemExit(f"HATA: 4 lig bekleniyordu, bulunan: {len(leagues) if isinstance(leagues, list) else type(leagues).__name__}")
+          if total_matches <= 0:
+              raise SystemExit(f"HATA: total_matches > 0 olmali, bulunan: {total_matches}")
+
+          (dist_dir / ".nojekyll").write_text("", encoding="utf-8")
+
+          def esc(val: object) -> str:
+              return html.escape(str(val if val is not None else "-"), quote=True)
+
+          raw_sources = data.get("sources_used")
+          if isinstance(raw_sources, list) and raw_sources:
+              sources_list = [str(s) for s in raw_sources if s]
+          else:
+              sources_list = [str(data.get("data_source") or "Transfermarkt")]
+          sources_count = int(data.get("sources_count", len(sources_list)))
+          sources_total = int(data.get("sources_total", max(5, sources_count)))
+          sources_label = ", ".join(sources_list) if sources_list else "-"
+
+          cards_html = "".join(
+              f'<article class="card">'
+              f'<h2>{esc(lg.get("name"))}</h2>'
+              f'<p class="sub">{esc(lg.get("country"))} &bull; Hafta {esc(lg.get("next_round"))}</p>'
+              f'<div class="metrics">'
+              f'<span>Tahmin: <b>{int(lg.get("matches_count", 0))}</b></span>'
+              f'<span>Oynanan: <b>{int(lg.get("played_matches_count", 0))}</b></span>'
+              f'<span>Sakatlık: <b>{int(lg.get("injuries_count", 0))}</b></span>'
+              f'</div></article>'
+              for lg in leagues
+          )
+
+          page_lines = [
+              "<!doctype html>",
+              '<html lang="tr">',
+              "<head>",
+              '  <meta charset="utf-8">',
+              '  <meta name="viewport" content="width=device-width, initial-scale=1">',
+              "  <title>⚽ Futbol Skor &amp; Analiz Bülteni — Canlı Bulut CDN</title>",
+              "  <style>",
+              "    :root { color-scheme: dark; }",
+              "    * { box-sizing: border-box; }",
+              "    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0b1120; color: #e2e8f0; padding: 28px 16px; }",
+              "    .wrap { max-width: 880px; margin: 0 auto; }",
+              "    h1 { font-size: 1.45rem; margin: 0 0 8px; color: #f8fafc; }",
+              "    .meta { color: #94a3b8; font-size: 0.92rem; margin-bottom: 20px; line-height: 1.6; }",
+              "    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }",
+              "    .stat, .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 14px 16px; }",
+              "    .stat b { display: block; font-size: 1.35rem; color: #38bdf8; margin-top: 4px; }",
+              "    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }",
+              "    .card h2 { margin: 0 0 4px; font-size: 1.05rem; color: #f1f5f9; }",
+              "    .sub { margin: 0 0 10px; font-size: 0.85rem; color: #94a3b8; }",
+              "    .metrics { display: flex; flex-wrap: wrap; gap: 10px; font-size: 0.85rem; color: #cbd5e1; }",
+              "    a.btn { display: inline-block; background: #0284c7; color: #ffffff; text-decoration: none; font-weight: 600; padding: 10px 18px; border-radius: 8px; }",
+              "    a.btn:hover { background: #0369a1; }",
+              "  </style>",
+              "</head>",
+              "<body>",
+              '  <main class="wrap">',
+              "    <h1>⚽ Futbol Skor &amp; Analiz Bülteni — Canlı Bulut CDN</h1>",
+              '    <div class="meta">',
+              f'      Çoklu Kaynak: <b>{sources_count}/{sources_total} Doğruladı ({esc(sources_label)})</b> &bull;',
+              f'      Veri Kaynağı: <b>{esc(data.get("data_source"))}</b> &bull;',
+              f'      Sezon: <b>{esc(data.get("season"))}</b> &bull;',
+              f'      Son Güncelleme (UTC): <b>{esc(data.get("generated_at"))}</b>',
+              "    </div>",
+              '    <section class="stats">',
+              f'      <div class="stat">Haftalık Tahmin Maçı<b>{total_matches}</b></div>',
+              f'      <div class="stat">Analiz Edilen Oynanmış Maç<b>{int(data.get("total_played_matches", 0))}</b></div>',
+              f'      <div class="stat">Aktif Sakat / Eksik Oyuncu<b>{int(data.get("total_injuries", 0))}</b></div>',
+              f'      <div class="stat">Aktif Veri Kaynağı<b>{sources_count}/{sources_total}</b></div>',
+              "    </section>",
+              f'    <section class="grid">{cards_html}</section>',
+              '    <a class="btn" href="./bulletin.json">Canlı JSON Bültenini Aç (./bulletin.json)</a>',
+              "  </main>",
+              "</body>",
+              "</html>",
+          ]
+          (dist_dir / "index.html").write_text("\n".join(page_lines) + "\n", encoding="utf-8")
+          print(f"Dogrulama tamamlandi: 4 lig, {total_matches} mac, index.html ve .nojekyll hazir.")
+          PY
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

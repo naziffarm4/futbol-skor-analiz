@@ -1,0 +1,47 @@
+# Ortam değişkenleri ve gizli anahtarlar
+.env
+.env.*
+!.env.example
+
+# Python önbellek ve sanal ortamlar
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Bülten geçici / yerel önbellek ve dağıtım çıktıları
+dist/
+build/
+engine/data/*.tmp
+engine/data/.*.tmp
+engine/data/bulletin_cache.json
+
+# Flutter / Mobil derleme ve imzalama çıktıları
+mobile/build/
+mobile/.dart_tool/
+mobile/.flutter-plugins*
+*.apk
+*.aab
+*.ipa
+*.keystore
+*.jks
+key.properties
+
+# Graphify yerel çıktıları ve önbelleği
+graphify-out/
+
+# Yerel AI / ajan yapılandırmaları
+.claude/
+CLAUDE.md
+GEMINI.md
+
+# İşletim sistemi ve IDE dosyaları
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
