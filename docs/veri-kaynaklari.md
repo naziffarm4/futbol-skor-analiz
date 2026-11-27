@@ -10,7 +10,7 @@ Bu belge, tahmin ve bülten motorunun kullandığı resmi API'leri, açık veri 
 |---|---|---|---|---|
 | **The Odds API v4** (`api.the-odds-api.com`) | Resmi REST API | 4 lig için Avrupa bahis büroları (`regions=eu`) 1X2 (`h2h`) ve 2.5 Alt/Üst (`totals`) konsensüs marjsız olasılıkları | `?apiKey=<THE_ODDS_API_KEY>` (URL tanılama çıktılarında `***REDACTED***` olarak maskelenir) | Aylık **500 kredi** (`h2h,totals` + `eu` = çağrı başına 2 kredi) |
 | **API-Football v3** (`v3.football.api-sports.io`) | Resmi REST API | Fikstür, ilk yarı / maç sonu skorları (`score.halftime` / `score.fulltime`), hafta numarası ve sakatlık/eksik kadro kayıtları | `x-apisports-key: <API_FOOTBALL_KEY>` | Günlük **100 istek**, dakikada **10 istek** (Ücretsiz planda sezon kapsamı kısıtı kontrol edilir) |
-| **ESPN Public Site API** (`site.api.espn.com`) | Açık JSON API | Canlı puan durumu, oynanmış maç skorları ve gelecek 21 günlük takvim penceresi (`?dates=YYYYMMDD-YYYYMMDD`) | Gerektirmez | Kibar HTTP istemcisi |
+| **ESPN Public Site API** (`site.api.espn.com`) | Açık JSON API | Canlı puan durumu, oynanmış maç skorları ve `leagues[0].calendar` tabanlı tekil `?dates=YYYYMMDD` takvim penceresi | Gerektirmez | Kibar HTTP istemcisi |
 | **Football-Data.co.uk & OpenFootball** | Açık CSV / JSON | Maç başı İY/MS golleri (`HTHG`, `HTAG`, `FTHG`, `FTAG`), şut, isabetli şut, korner, kart ve geçmiş piyasa kapanış oranları | Gerektirmez | Statik CSV/JSON |
 | **Understat & Şut Tabanlı xG Vekili** | Açık İstatistik | Takım bazlı beklenen gol (`xG` / `xGA`) metrikleri; kapsam dışı liglerde şut/isabetli şut kalibrasyonu | Gerektirmez | Kibar HTTP istemcisi |
 | **SportsGambler / TheSportsDB** | İkincil Çapraz Kaynak | Sakat ve cezalı oyuncu çapraz doğrulaması ve yedek puan durumu | Gerektirmez | Kibar HTTP istemcisi |
@@ -23,7 +23,7 @@ Bu belge, tahmin ve bülten motorunun kullandığı resmi API'leri, açık veri 
 | `super_lig` (Süper Lig) | `203` | `soccer_turkey_super_league` | `tur.1` | `T1` |
 | `premier_league` (Premier League) | `39` | `soccer_epl` | `eng.1` | `E0` |
 | `la_liga` (La Liga) | `140` | `soccer_spain_la_liga` | `esp.1` | `SP1` |
-| `ligue_1` (Ligue 1) | `61` | `soccer_france_ligue_1` | `fra.1` | `F1` |
+| `ligue_1` (Ligue 1) | `61` | `soccer_france_ligue_one` | `fra.1` | `F1` |
 
 ---
 

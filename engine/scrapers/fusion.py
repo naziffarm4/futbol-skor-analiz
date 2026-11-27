@@ -146,7 +146,7 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
         "buyuksehir belediye erzurumspor",
     ),
     "ankaragucu": ("ankaragucu", "mke ankaragucu"),
-    "amedspor": ("amed", "amed sk", "amedspor", "amed sportif", "amed sportif faaliyetler"),
+    "amedspor": ("amed", "amed sk", "amed sfk", "amedspor", "amed sportif", "amed sportif faaliyetler"),
     "pendikspor": ("pendikspor", "pendik"),
     "eyupspor_alt": ("ikas eyup",),
     # Premier League
@@ -197,8 +197,22 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "real madrid": ("real madrid", "real madrid cf"),
     "barcelona": ("barcelona", "fc barcelona", "barca"),
     "real oviedo": ("oviedo", "real oviedo"),
+    "deportivo la coruna": (
+        "deportivo",
+        "rc deportivo",
+        "deportivo la coruna",
+        "deportivo de la coruna",
+    ),
+    "racing santander": (
+        "racing santander",
+        "real racing santander",
+        "real racing club de santander",
+        "racing",
+    ),
     # Ligue 1 & Avrupa referansları
     "paris fc": ("paris fc",),
+    "le mans": ("le mans", "le mans fc"),
+    "troyes": ("troyes", "es troyes", "es troyes ac", "estac troyes"),
     "paris saint germain": (
         "psg",
         "paris sg",

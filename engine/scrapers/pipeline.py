@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -79,6 +79,55 @@ def _order_sources(sources: Iterable[str]) -> list[str]:
             unique.append(s)
     rank_map = {name: idx for idx, name in enumerate(CANONICAL_SOURCE_ORDER)}
     return sorted(unique, key=lambda name: (rank_map.get(name, 99), name))
+
+
+def group_upcoming_into_rounds(
+    upcoming_candidates: Sequence[tuple[datetime, str, str, str, str]],
+    *,
+    next_round_num: int,
+    initial_busy_teams: set[str] | None = None,
+    max_cluster_span_days: int = 4,
+    max_day_gap_days: int = 3,
+) -> list[tuple[datetime, str, str, int]]:
+    """Yaklaşan SCHEDULED maçları <= 4 günlük hafta kümesi ve takım ayrıklığıyla gruplar."""
+    if not upcoming_candidates:
+        return []
+
+    sorted_items = sorted(upcoming_candidates, key=lambda item: item[0])
+    grouped: list[tuple[datetime, str, str, int]] = []
+    current_round = next_round_num
+    cluster_start: date | None = None
+    cluster_end: date | None = None
+    cluster_teams: set[str] = set(initial_busy_teams or ())
+
+    for m_dt, h_disp, a_disp, hk, ak in sorted_items:
+        m_date = m_dt.date()
+        if cluster_start is None or cluster_end is None:
+            if hk in cluster_teams or ak in cluster_teams:
+                cluster_teams = set()
+            cluster_start = m_date
+            cluster_end = m_date
+            cluster_teams.add(hk)
+            cluster_teams.add(ak)
+            grouped.append((m_dt, h_disp, a_disp, current_round))
+            continue
+
+        span_days = (m_date - cluster_start).days
+        gap_days = (m_date - cluster_end).days
+        has_team_collision = hk in cluster_teams or ak in cluster_teams
+        if span_days > max_cluster_span_days or gap_days > max_day_gap_days or has_team_collision:
+            current_round += 1
+            cluster_start = m_date
+            cluster_end = m_date
+            cluster_teams = {hk, ak}
+        else:
+            if m_date > cluster_end:
+                cluster_end = m_date
+            cluster_teams.add(hk)
+            cluster_teams.add(ak)
+        grouped.append((m_dt, h_disp, a_disp, current_round))
+
+    return grouped
 
 
 def _team_lookup_key(name: str) -> str:
@@ -322,27 +371,54 @@ class IngestionPipeline:
             return
         start_d = reference_date or date.today()
         end_d = start_d + timedelta(days=21)
+        lookback_d = start_d - timedelta(days=1)
+        cal_dates: list[date] = []
+        for raw_d in espn_data.calendar_dates:
+            try:
+                parsed_d = date.fromisoformat(raw_d[:10])
+            except ValueError:
+                continue
+            if lookback_d <= parsed_d <= end_d:
+                cal_dates.append(parsed_d)
+
+        # ESPN soccer scoreboard tireli tarih aralığını (YYYYMMDD-YYYYMMDD) HTTP 400 ile reddeder;
+        # takvimdeki gerçek maç günleri (veya 7 günlük pencere) tekil YYYYMMDD olarak sorgulanır.
+        query_dates = (
+            sorted(set(cal_dates))[:8]
+            if cal_dates
+            else [start_d + timedelta(days=offset) for offset in range(7)]
+        )
+
         slug = ESPN_LEAGUE_SLUGS[league_id]
         url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
-        try:
-            resp = self.espn_adapter._client.get(
-                url,
-                params={"dates": f"{start_d:%Y%m%d}-{end_d:%Y%m%d}"},
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code == 200:
-                extra_fixtures = parse_espn_scoreboard_json(resp.json())
-                existing_pairs = {
-                    (fold_ascii(fx.home_team), fold_ascii(fx.away_team), fx.match_date[:10])
-                    for fx in espn_data.fixtures
-                }
-                for fx in extra_fixtures:
-                    key = (fold_ascii(fx.home_team), fold_ascii(fx.away_team), fx.match_date[:10])
-                    if key not in existing_pairs:
-                        existing_pairs.add(key)
-                        espn_data.fixtures.append(fx)
-        except Exception as exc:
-            logger.warning("ESPN 21 günlük takvim penceresi hatası (%s): %s", league_id.value, exc)
+        existing_pairs = {
+            (fold_ascii(fx.home_team), fold_ascii(fx.away_team), fx.match_date[:10])
+            for fx in espn_data.fixtures
+        }
+        for q_date in query_dates:
+            try:
+                resp = self.espn_adapter._client.get(
+                    url,
+                    params={"dates": f"{q_date:%Y%m%d}"},
+                    headers={"Accept": "application/json"},
+                )
+                if resp.status_code == 200:
+                    for fx in parse_espn_scoreboard_json(resp.json()):
+                        key = (
+                            fold_ascii(fx.home_team),
+                            fold_ascii(fx.away_team),
+                            fx.match_date[:10],
+                        )
+                        if key not in existing_pairs:
+                            existing_pairs.add(key)
+                            espn_data.fixtures.append(fx)
+            except Exception as exc:
+                logger.warning(
+                    "ESPN takvim günü hatası (%s, %s): %s",
+                    league_id.value,
+                    q_date.isoformat(),
+                    exc,
+                )
 
     def _synthesize_fallback_fixtures(
         self,
@@ -370,8 +446,11 @@ class IngestionPipeline:
                 )
 
         if espn_data is not None:
-            has_espn_sched = any(fx.status != "FINISHED" for fx in espn_data.fixtures)
-            if not has_espn_sched:
+            expected_per_round = (
+                max(6, len(espn_data.standings) // 2) if espn_data.standings else 8
+            )
+            espn_sched_count = sum(1 for fx in espn_data.fixtures if fx.status != "FINISHED")
+            if espn_sched_count < expected_per_round:
                 self._fetch_espn_upcoming_window(
                     league_id, espn_data, reference_date=reference_date
                 )
@@ -379,22 +458,38 @@ class IngestionPipeline:
         alias = TeamAliasResolver()
         canonical_display: dict[str, str] = {}
 
-        def _register_name(raw_name: str) -> str:
+        def _register_roster_team(raw_name: str) -> str:
             cleaned = normalize_team_name(raw_name)
             if not cleaned:
                 return ""
             alias.register_teams([cleaned])
-            rk = alias.resolve_key(cleaned)
+            rk = alias.canonical_key(cleaned)
             if rk and rk not in canonical_display:
                 canonical_display[rk] = cleaned
             return canonical_display.get(rk, cleaned)
 
+        def _register_name(raw_name: str) -> str:
+            cleaned = normalize_team_name(raw_name)
+            if not cleaned:
+                return ""
+            ck = alias.canonical_key(cleaned)
+            if ck in canonical_display:
+                return canonical_display[ck]
+            if canonical_display:
+                rk = alias.resolve_key(cleaned)
+                if rk in canonical_display:
+                    return canonical_display[rk]
+            return _register_roster_team(cleaned)
+
         if af_data is not None:
             for t in af_data.teams:
-                _register_name(t.name)
+                _register_roster_team(t.name)
         if espn_data is not None:
             for row in espn_data.standings:
-                _register_name(row.team_name)
+                _register_roster_team(row.team_name)
+        if secondary_data is not None and not canonical_display:
+            for srow in secondary_data.standings:
+                _register_roster_team(srow.team_name)
         if fd_data is not None:
             for tname in fd_data.team_stats:
                 _register_name(tname)
@@ -508,17 +603,23 @@ class IngestionPipeline:
                 )
 
         next_round_num = max(1, max_played_round + 1)
-        upcoming_candidates: list[tuple[datetime, str, str]] = []
+        upcoming_candidates: list[tuple[datetime, str, str, str, str]] = []
         seen_upcoming: set[tuple[str, str]] = set()
 
         if espn_data is not None:
             for fx in espn_data.fixtures:
-                if fx.status == "FINISHED":
+                if fx.status == "FINISHED" or fx.status == "POSTPONED":
                     continue
                 h_disp = _register_name(fx.home_team)
                 a_disp = _register_name(fx.away_team)
                 hk, ak = alias.resolve_key(h_disp), alias.resolve_key(a_disp)
-                if not h_disp or not a_disp or hk == ak or (hk, ak) in seen_upcoming:
+                if (
+                    not h_disp
+                    or not a_disp
+                    or hk == ak
+                    or (hk, ak) in seen_upcoming
+                    or (hk, ak) in seen_finished
+                ):
                     continue
                 seen_upcoming.add((hk, ak))
                 upcoming_candidates.append(
@@ -526,6 +627,8 @@ class IngestionPipeline:
                         _parse_flexible_datetime(fx.match_date, fallback_date=reference_date),
                         h_disp,
                         a_disp,
+                        hk,
+                        ak,
                     )
                 )
 
@@ -534,7 +637,13 @@ class IngestionPipeline:
                 h_disp = _register_name(om.home_team)
                 a_disp = _register_name(om.away_team)
                 hk, ak = alias.resolve_key(h_disp), alias.resolve_key(a_disp)
-                if not h_disp or not a_disp or hk == ak or (hk, ak) in seen_upcoming:
+                if (
+                    not h_disp
+                    or not a_disp
+                    or hk == ak
+                    or (hk, ak) in seen_upcoming
+                    or (hk, ak) in seen_finished
+                ):
                     continue
                 seen_upcoming.add((hk, ak))
                 upcoming_candidates.append(
@@ -542,17 +651,34 @@ class IngestionPipeline:
                         _parse_flexible_datetime(om.commence_time, fallback_date=reference_date),
                         h_disp,
                         a_disp,
+                        hk,
+                        ak,
                     )
                 )
 
-        upcoming_candidates.sort(key=lambda item: item[0])
-        team_sched_counts: dict[str, int] = {}
-        for m_dt, h_disp, a_disp in upcoming_candidates:
-            hk, ak = alias.resolve_key(h_disp), alias.resolve_key(a_disp)
-            slot = max(team_sched_counts.get(hk, 0), team_sched_counts.get(ak, 0))
-            assigned_round = next_round_num + slot
-            team_sched_counts[hk] = slot + 1
-            team_sched_counts[ak] = slot + 1
+        first_upcoming_date = (
+            min(item[0] for item in upcoming_candidates).date() if upcoming_candidates else None
+        )
+        recent_fin_teams: set[str] = set()
+        if first_upcoming_date is not None:
+            fin_window_teams: set[str] = set()
+            for sm in synth_matches:
+                if sm.status != MatchStatus.FINISHED:
+                    continue
+                gap_days = (first_upcoming_date - sm.match_date.date()).days
+                if 0 <= gap_days <= 2:
+                    fin_window_teams.add(alias.resolve_key(sm.home_team_name))
+                    fin_window_teams.add(alias.resolve_key(sm.away_team_name))
+            full_round_team_threshold = max(6, (len(teams) * 3) // 4) if teams else 12
+            if 0 < len(fin_window_teams) < full_round_team_threshold:
+                recent_fin_teams = fin_window_teams
+
+        grouped_upcoming = group_upcoming_into_rounds(
+            upcoming_candidates,
+            next_round_num=next_round_num,
+            initial_busy_teams=recent_fin_teams,
+        )
+        for m_dt, h_disp, a_disp, assigned_round in grouped_upcoming:
             synth_matches.append(
                 ScrapedMatch(
                     league_id=league_id,

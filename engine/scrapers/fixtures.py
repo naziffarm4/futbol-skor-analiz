@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from typing import Any
 
 from bs4 import BeautifulSoup, Tag
 
@@ -97,6 +99,51 @@ class ScrapedMatch:
         )
 
 
+def select_next_round(
+    finished_matches: Sequence[Any],
+    scheduled_matches: Sequence[Any],
+) -> int | None:
+    """Ertelenmiş geçmiş hafta maçlarını atlayarak sıradaki aktif lig haftasını seçer."""
+    if not scheduled_matches:
+        return None
+
+    scheduled_rounds = sorted({int(m.round) for m in scheduled_matches})
+    if len(scheduled_rounds) == 1:
+        return scheduled_rounds[0]
+
+    max_finished_round = max((int(m.round) for m in finished_matches), default=0)
+    finished_in_round: dict[int, int] = {}
+    for m in finished_matches:
+        r = int(m.round)
+        finished_in_round[r] = finished_in_round.get(r, 0) + 1
+
+    sched_in_round: dict[int, int] = {}
+    earliest_sched_by_round: dict[int, datetime] = {}
+    for m in scheduled_matches:
+        r = int(m.round)
+        sched_in_round[r] = sched_in_round.get(r, 0) + 1
+        cur = earliest_sched_by_round.get(r)
+        if cur is None or m.match_date < cur:
+            earliest_sched_by_round[r] = m.match_date
+
+    for idx, rnd in enumerate(scheduled_rounds):
+        if rnd < max_finished_round:
+            continue
+        if finished_in_round.get(rnd, 0) > 0 and idx + 1 < len(scheduled_rounds):
+            next_rnd = scheduled_rounds[idx + 1]
+            if earliest_sched_by_round[rnd] > earliest_sched_by_round[next_rnd]:
+                continue
+            if (
+                finished_in_round[rnd] >= 4
+                and sched_in_round[rnd] <= 2
+                and sched_in_round[next_rnd] > sched_in_round[rnd] * 2
+            ):
+                continue
+        return rnd
+
+    return scheduled_rounds[-1]
+
+
 @dataclass(slots=True)
 class LeagueFixturesData:
     league_id: LeagueId
@@ -113,18 +160,7 @@ class LeagueFixturesData:
 
     @property
     def next_round(self) -> int | None:
-        sched = self.scheduled_matches
-        if not sched:
-            return None
-        sched_rounds = sorted({m.round for m in sched})
-        if len(sched_rounds) == 1:
-            return sched_rounds[0]
-        played = self.played_matches
-        max_fin = max((m.round for m in played), default=0)
-        for rnd in sched_rounds:
-            if rnd >= max_fin:
-                return rnd
-        return sched_rounds[-1]
+        return select_next_round(self.played_matches, self.scheduled_matches)
 
     @property
     def next_round_matches(self) -> list[ScrapedMatch]:

@@ -112,7 +112,7 @@ THE_ODDS_API_SPORT_KEYS: dict[LeagueId, str] = {
     LeagueId.SUPER_LIG: "soccer_turkey_super_league",
     LeagueId.PREMIER_LEAGUE: "soccer_epl",
     LeagueId.LA_LIGA: "soccer_spain_la_liga",
-    LeagueId.LIGUE_1: "soccer_france_ligue_1",
+    LeagueId.LIGUE_1: "soccer_france_ligue_one",
 }
 
 

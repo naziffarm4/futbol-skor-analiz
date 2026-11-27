@@ -9,7 +9,6 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
 
 from supabase import Client
@@ -25,6 +24,7 @@ from engine.predictors.ratings import (
     build_team_ratings,
     calculate_league_baseline,
 )
+from engine.scrapers.fixtures import select_next_round
 
 logger = logging.getLogger(__name__)
 
@@ -220,43 +220,6 @@ def _resolve_league_team_metrics(
                 if matched_tid is not None and matched_tid not in resolved:
                     resolved[matched_tid] = metric_obj
     return resolved or None
-
-
-def select_next_round(
-    finished_matches: Sequence[Any],
-    scheduled_matches: Sequence[Any],
-) -> int | None:
-    """Ertelenmiş geçmiş hafta maçlarını atlayarak sıradaki aktif lig haftasını seçer."""
-    if not scheduled_matches:
-        return None
-
-    scheduled_rounds = sorted({int(m.round) for m in scheduled_matches})
-    if len(scheduled_rounds) == 1:
-        return scheduled_rounds[0]
-
-    max_finished_round = max((int(m.round) for m in finished_matches), default=0)
-    finished_in_round: dict[int, int] = {}
-    for m in finished_matches:
-        r = int(m.round)
-        finished_in_round[r] = finished_in_round.get(r, 0) + 1
-
-    earliest_sched_by_round: dict[int, datetime] = {}
-    for m in scheduled_matches:
-        r = int(m.round)
-        cur = earliest_sched_by_round.get(r)
-        if cur is None or m.match_date < cur:
-            earliest_sched_by_round[r] = m.match_date
-
-    for idx, rnd in enumerate(scheduled_rounds):
-        if rnd < max_finished_round:
-            continue
-        if finished_in_round.get(rnd, 0) > 0 and idx + 1 < len(scheduled_rounds):
-            next_rnd = scheduled_rounds[idx + 1]
-            if earliest_sched_by_round[rnd] > earliest_sched_by_round[next_rnd]:
-                continue
-        return rnd
-
-    return scheduled_rounds[-1]
 
 
 class PredictionService:

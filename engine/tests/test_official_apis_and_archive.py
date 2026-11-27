@@ -13,8 +13,9 @@ from unittest.mock import patch
 import httpx
 
 from engine.archive import save_snapshot
-from engine.config import LeagueId, Settings
+from engine.config import THE_ODDS_API_SPORT_KEYS, LeagueId, Settings
 from engine.models.schemas import MatchStatus
+from engine.predictors import PredictionService, select_next_round
 from engine.scrapers.base import BaseScraper, ScraperHTTPError
 from engine.scrapers.fixtures import FixturesScraper
 from engine.scrapers.injuries import InjuriesScraper
@@ -614,6 +615,253 @@ class ZeroWafAndResilientPipelineTests(unittest.TestCase):
             )
             self.assertIn("p_over25", fb_gs_odds)
             self.assertIn("p_under25", fb_gs_odds)
+
+    def test_ligue1_friday_plus_eight_weekend_matches_grouped_into_single_next_round(
+        self,
+    ) -> None:
+        self.assertEqual(THE_ODDS_API_SPORT_KEYS[LeagueId.LIGUE_1], "soccer_france_ligue_one")
+
+        ligue1_teams = [
+            "Brest",
+            "Paris FC",
+            "Angers SCO",
+            "RC Lens",
+            "Le Havre AC",
+            "RC Strasbourg Alsace",
+            "Le Mans FC",
+            "LOSC Lille",
+            "Paris Saint-Germain",
+            "FC Lorient",
+            "OGC Nice",
+            "ES Troyes AC",
+            "AJ Auxerre",
+            "Olympique de Marseille",
+            "Toulouse FC",
+            "Stade Rennais",
+            "Olympique Lyonnais",
+            "AS Monaco",
+        ]
+
+        def _espn_event(home: str, away: str, iso_dt: str, completed: bool = False) -> dict[str, object]:
+            st_name = "STATUS_FULL_TIME" if completed else "STATUS_SCHEDULED"
+            return {
+                "date": iso_dt,
+                "status": {"type": {"completed": completed, "name": st_name}},
+                "competitions": [
+                    {
+                        "competitors": [
+                            {
+                                "homeAway": "home",
+                                "team": {"id": home[:3], "displayName": home},
+                                "score": "2" if completed else "0",
+                            },
+                            {
+                                "homeAway": "away",
+                                "team": {"id": away[:3], "displayName": away},
+                                "score": "1" if completed else "0",
+                            },
+                        ]
+                    }
+                ],
+            }
+
+        standings_payload = {
+            "standings": {
+                "entries": [
+                    {
+                        "team": {"displayName": name, "shortDisplayName": name[:12]},
+                        "stats": [
+                            {"name": "rank", "value": idx},
+                            {"name": "gamesPlayed", "value": 11},
+                            {"name": "points", "value": 30 - idx},
+                            {"name": "pointsFor", "value": 20},
+                            {"name": "pointsAgainst", "value": 12},
+                        ],
+                    }
+                    for idx, name in enumerate(ligue1_teams, start=1)
+                ]
+            }
+        }
+        calendar_list = [
+            "2026-11-27T08:00Z",
+            "2026-11-28T08:00Z",
+            "2026-11-29T08:00Z",
+            "2026-12-04T08:00Z",
+            "2026-12-05T08:00Z",
+        ]
+        events_by_day = {
+            "20261127": [_espn_event("Brest", "Paris FC", "2026-11-27T19:45Z")],
+            "20261128": [
+                _espn_event("Angers SCO", "RC Lens", "2026-11-28T16:15Z"),
+                _espn_event("Le Havre AC", "RC Strasbourg Alsace", "2026-11-28T18:00Z"),
+                _espn_event("Le Mans FC", "LOSC Lille", "2026-11-28T19:45Z"),
+                _espn_event("Paris Saint-Germain", "FC Lorient", "2026-11-28T19:45Z"),
+                _espn_event("OGC Nice", "ES Troyes AC", "2026-11-28T20:00Z"),
+            ],
+            "20261129": [
+                _espn_event("AJ Auxerre", "Olympique de Marseille", "2026-11-29T14:00Z"),
+                _espn_event("Toulouse FC", "Stade Rennais", "2026-11-29T16:15Z"),
+                _espn_event("Olympique Lyonnais", "AS Monaco", "2026-11-29T19:45Z"),
+            ],
+            "20261204": [
+                _espn_event("Toulouse FC", "Paris Saint-Germain", "2026-12-04T19:45Z"),
+            ],
+            "20261205": [
+                _espn_event("LOSC Lille", "AJ Auxerre", "2026-12-05T16:15Z"),
+                _espn_event("Brest", "AS Monaco", "2026-12-05T18:00Z"),
+            ],
+        }
+        fd_csv = (
+            "Div,Date,HomeTeam,AwayTeam,FTHG,FTAG,HTHG,HTAG,HTR\n"
+            "F1,21/11/2026,Paris SG,Toulouse,3,1,2,0,H\n"
+            "F1,22/11/2026,Monaco,Brest,2,0,1,0,H\n"
+        )
+        odds_ligue1 = [
+            {
+                "id": "fr_sat_psg",
+                "sport_key": "soccer_france_ligue_one",
+                "commence_time": "2026-11-28T19:45:00Z",
+                "home_team": "Paris Saint Germain",
+                "away_team": "Lorient",
+                "bookmakers": [
+                    {
+                        "key": "pinnacle",
+                        "markets": [
+                            {
+                                "key": "h2h",
+                                "outcomes": [
+                                    {"name": "Paris Saint Germain", "price": 1.35},
+                                    {"name": "Draw", "price": 5.20},
+                                    {"name": "Lorient", "price": 8.50},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = QuotaBudgetTracker(
+                budget_path=Path(tmp) / "budget.json",
+                cache_dir=Path(tmp) / "cache",
+            )
+
+            def tm_202(_: httpx.Request) -> httpx.Response:
+                return httpx.Response(202, text="<script>AwsWafIntegration</script>")
+
+            def ext_handler(req: httpx.Request) -> httpx.Response:
+                url_s = str(req.url)
+                if "api-sports.io" in url_s:
+                    return httpx.Response(
+                        200,
+                        json={"errors": {"plan": "restricted"}, "results": 0, "response": []},
+                    )
+                if "the-odds-api.com" in url_s:
+                    if "soccer_france_ligue_one" not in url_s:
+                        return httpx.Response(404, json={"message": "Unknown sport"})
+                    return httpx.Response(
+                        200,
+                        headers={"x-requests-remaining": "485", "x-requests-used": "15"},
+                        json=odds_ligue1,
+                    )
+                if "espn.com" in url_s and "scoreboard" in url_s:
+                    dates_param = req.url.params.get("dates")
+                    if dates_param is None:
+                        return httpx.Response(
+                            200,
+                            json={
+                                "leagues": [{"calendar": calendar_list}],
+                                "events": events_by_day["20261127"],
+                            },
+                        )
+                    if "-" in dates_param:
+                        return httpx.Response(400, json={"code": 400, "message": "Bad Request"})
+                    return httpx.Response(
+                        200,
+                        json={"events": events_by_day.get(dates_param, [])},
+                    )
+                if "espn.com" in url_s and "standings" in url_s:
+                    return httpx.Response(200, json=standings_payload)
+                if "football-data.co.uk" in url_s:
+                    return httpx.Response(200, text=fd_csv)
+                if "sportsgambler.com" in url_s:
+                    return httpx.Response(200, text="<html></html>")
+                if "understat.com" in url_s:
+                    return httpx.Response(200, json={"teams": {}})
+                return httpx.Response(404)
+
+            with (
+                httpx.Client(
+                    base_url="https://mock.tm.local",
+                    transport=httpx.MockTransport(tm_202),
+                ) as tm_c,
+                httpx.Client(transport=httpx.MockTransport(ext_handler)) as ext_c,
+                httpx.Client(
+                    base_url="https://v3.football.api-sports.io",
+                    transport=httpx.MockTransport(ext_handler),
+                ) as af_c,
+                httpx.Client(
+                    base_url="https://api.the-odds-api.com",
+                    transport=httpx.MockTransport(ext_handler),
+                ) as odds_c,
+            ):
+                base_http = BaseScraper(
+                    base_url="https://mock.tm.local",
+                    min_delay=0.0,
+                    max_delay=0.0,
+                    max_retries=0,
+                    client=tm_c,
+                )
+                pipeline = IngestionPipeline(
+                    http=base_http,
+                    fixtures_scraper=FixturesScraper(base_http),
+                    injuries_scraper=InjuriesScraper(base_http),
+                    enable_multi_source=True,
+                    espn_adapter=ESPNAdapter(client=ext_c),
+                    football_data_adapter=FootballDataAdapter(
+                        client=ext_c, allow_mirror_fallback=False
+                    ),
+                    understat_adapter=UnderstatAdapter(client=ext_c, allow_opta_bridge=False),
+                    secondary_adapter=SecondaryCheckAdapter(
+                        client=ext_c, allow_live_fallbacks=False
+                    ),
+                    api_football_adapter=ApiFootballAdapter(
+                        api_key=FAKE_AF_KEY, client=af_c, tracker=tracker
+                    ),
+                    odds_adapter=TheOddsApiAdapter(
+                        api_key=FAKE_ODDS_KEY, client=odds_c, tracker=tracker
+                    ),
+                )
+                res = pipeline.run_league(
+                    LeagueId.LIGUE_1,
+                    reference_date=date(2026, 11, 27),
+                    persist=False,
+                )
+
+            finished = [m for m in res.matches if m.status == MatchStatus.FINISHED]
+            scheduled = [m for m in res.matches if m.status == MatchStatus.SCHEDULED]
+            target_round = select_next_round(finished, scheduled)
+            self.assertEqual(target_round, 12)
+
+            next_round_matches = [m for m in scheduled if m.round == target_round]
+            later_round_matches = [m for m in scheduled if m.round == 13]
+            self.assertEqual(len(next_round_matches), 9)
+            self.assertEqual(len(later_round_matches), 3)
+
+            pred_res = PredictionService().run(
+                matches=res.matches,
+                teams=res.teams,
+                team_metrics=res.team_metrics,
+                market_odds=res.market_odds,
+                only_next_round=True,
+                persist=False,
+            )
+            self.assertEqual(len(pred_res.bundles), 9)
+            for bundle in pred_res.bundles:
+                ht_ft_total = sum(item.prob for item in bundle.prediction.all_ht_ft_json)
+                self.assertEqual(len(bundle.prediction.all_ht_ft_json), 9)
+                self.assertAlmostEqual(ht_ft_total, 1.0, places=4)
 
 
 class ArchiveSnapshotTests(unittest.TestCase):

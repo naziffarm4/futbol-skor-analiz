@@ -32,6 +32,7 @@ from engine.predictors.service import (
     PredictionService,
     PredictionServiceResult,
     run_prediction_pipeline,
+    select_next_round,
 )
 
 __all__ = [
@@ -63,4 +64,5 @@ __all__ = [
     "poisson_pmf",
     "predict_score_distribution",
     "run_prediction_pipeline",
+    "select_next_round",
 ]

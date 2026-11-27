@@ -64,6 +64,23 @@ class ESPNLeagueData:
     league_id: LeagueId
     standings: list[ESPNStandingRow] = field(default_factory=list)
     fixtures: list[ESPNFixtureRecord] = field(default_factory=list)
+    calendar_dates: list[str] = field(default_factory=list)
+
+
+def parse_espn_calendar_dates(payload: dict[str, Any]) -> list[str]:
+    """ESPN scoreboard yanıtındaki sezonluk maç takvimi günlerini (YYYY-MM-DD) çıkarır."""
+    leagues = payload.get("leagues")
+    if not isinstance(leagues, list) or not leagues or not isinstance(leagues[0], dict):
+        return []
+    raw_cal = leagues[0].get("calendar")
+    if not isinstance(raw_cal, list):
+        return []
+    seen: set[str] = set()
+    for item in raw_cal:
+        val = item.get("value") if isinstance(item, dict) else item
+        if isinstance(val, str) and len(val) >= 10 and val[4] == "-" and val[7] == "-":
+            seen.add(val[:10])
+    return sorted(seen)
 
 
 def _american_to_implied_prob(raw: Any) -> float | None:
@@ -369,7 +386,9 @@ class ESPNAdapter:
             sb_resp = self._client.get(scoreboard_url, headers={"Accept": "application/json"})
             http_status = sb_resp.status_code
             if sb_resp.status_code == 200:
-                data.fixtures = parse_espn_scoreboard_json(sb_resp.json())
+                sb_payload = sb_resp.json()
+                data.fixtures = parse_espn_scoreboard_json(sb_payload)
+                data.calendar_dates = parse_espn_calendar_dates(sb_payload)
             else:
                 errors.append(f"scoreboard HTTP {sb_resp.status_code}")
         except Exception as exc:
