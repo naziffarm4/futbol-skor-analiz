@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
-from engine.models.schemas import HT_FT_LABELS_TR, HtFtProbability, ScoreProbability
+from engine.models.schemas import (
+    ALL_HT_FT_CODES,
+    HT_FT_LABELS_TR,
+    HtFtProbability,
+    ScoreProbability,
+)
 from engine.predictors.ratings import DEFAULT_AVG_AWAY_GOALS, DEFAULT_AVG_HOME_GOALS
 
 DEFAULT_DIXON_COLES_RHO = -0.10
 DEFAULT_MAX_GOALS = 10
+DEFAULT_MARKET_BLEND_ALPHA: float = 0.65
 MIN_EXPECTED_GOALS = 0.15
 MIN_HALF_EXPECTED_GOALS = 0.03
 MIN_SECOND_HALF_EXPECTED_GOALS = 0.05
@@ -18,17 +26,7 @@ DEFAULT_HT_SHARE = 0.43
 MIN_HT_SHARE = 0.25
 MAX_HT_SHARE = 0.65
 
-_HT_FT_TIE_ORDER: tuple[str, ...] = (
-    "1/1",
-    "X/1",
-    "X/X",
-    "2/2",
-    "X/2",
-    "1/X",
-    "2/X",
-    "2/1",
-    "1/2",
-)
+_HT_FT_TIE_ORDER: tuple[str, ...] = ALL_HT_FT_CODES
 
 
 def poisson_pmf(goals: int, expected_goals: float) -> float:
@@ -148,6 +146,71 @@ def calculate_confidence_rate(
     return round(min(0.95, max(0.15, raw)), 4)
 
 
+def _normalize_1x2(p_home: float, p_draw: float, p_away: float) -> tuple[float, float, float]:
+    total = p_home + p_draw + p_away
+    if total <= 0.0 or not math.isfinite(total):
+        return (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+    return (p_home / total, p_draw / total, p_away / total)
+
+
+def normalized_shannon_entropy_1x2(p_home: float, p_draw: float, p_away: float) -> float:
+    """1X2 olasılık üçlüsünün [0, 1] aralığında normalize edilmiş Shannon entropisini hesaplar."""
+    probs = _normalize_1x2(p_home, p_draw, p_away)
+    entropy = -sum(p * math.log(p) for p in probs if p > 0.0)
+    return min(1.0, max(0.0, entropy / math.log(3.0)))
+
+
+def _round_basis_points(
+    raw_weights: Sequence[float],
+    target_bp: int,
+    tie_ranks: Sequence[int],
+) -> list[int]:
+    """Toplamı tam target_bp (10000 baz puan = 1.0000) olacak şekilde en büyük kalanla yuvarlar."""
+    n = len(raw_weights)
+    if n == 0 or target_bp <= 0:
+        return [0] * n
+    w_sum = sum(max(0.0, w) for w in raw_weights)
+    if w_sum > 1e-12:
+        scaled = [(max(0.0, w) / w_sum) * target_bp for w in raw_weights]
+    else:
+        scaled = [target_bp / n for _ in raw_weights]
+    floors = [int(math.floor(x + 1e-12)) for x in scaled]
+    rem = target_bp - sum(floors)
+    if rem > 0:
+        order = sorted(
+            range(n),
+            key=lambda i: (-(scaled[i] - floors[i]), -scaled[i], tie_ranks[i]),
+        )
+        for idx in order[:rem]:
+            floors[idx] += 1
+    elif rem < 0:
+        order = sorted(
+            range(n),
+            key=lambda i: (scaled[i] - floors[i], scaled[i], -tie_ranks[i]),
+        )
+        for idx in order:
+            if rem == 0:
+                break
+            if floors[idx] > 0:
+                floors[idx] -= 1
+                rem += 1
+    return floors
+
+
+def _extract_finite_prob(market_probs: Mapping[str, Any] | Any, *keys: str) -> float | None:
+    for k in keys:
+        val = market_probs.get(k) if isinstance(market_probs, Mapping) else getattr(market_probs, k, None)
+        if val is None or isinstance(val, bool):
+            continue
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fval):
+            return fval
+    return None
+
+
 @dataclass(slots=True)
 class PoissonPredictionResult:
     """Maç bazlı beklenen goller, 0..max_goals olasılık matrisi, İY/MS dağılımı ve olası skorlar."""
@@ -169,6 +232,13 @@ class PoissonPredictionResult:
     predicted_ht_away_score: int = 0
     ht_ft_prediction: str = "X/X"
     top_ht_ft: list[HtFtProbability] = field(default_factory=list)
+    all_ht_ft: list[HtFtProbability] = field(default_factory=list)
+    over_25_prob: float = 0.0
+    under_25_prob: float = 0.0
+    btts_yes_prob: float = 0.0
+    btts_no_prob: float = 0.0
+    market_blended: bool = False
+    market_blend_weight: float = 0.0
 
 
 def predict_score_distribution(
@@ -190,6 +260,9 @@ def predict_score_distribution(
     away_ht_concede_share: float = DEFAULT_HT_SHARE,
     away_ht_attack_share: float = DEFAULT_HT_SHARE,
     home_ht_concede_share: float = DEFAULT_HT_SHARE,
+    market_probs: Mapping[str, float] | None = None,
+    market_blend_alpha: float | None = None,
+    market_blend_alpha_ou: float | None = None,
 ) -> PoissonPredictionResult:
     """Takım katsayılarından Dixon-Coles tam saha ve iki aşamalı İY/MS dağılımlarını üretir."""
     lam, mu = calculate_expected_goals(
@@ -208,6 +281,7 @@ def predict_score_distribution(
     draw = 0.0
     away_win = 0.0
     over_2_5 = 0.0
+    btts_yes = 0.0
 
     for x, row in enumerate(matrix):
         for y, prob in enumerate(row):
@@ -220,6 +294,8 @@ def predict_score_distribution(
                 away_win += prob
             if x + y >= 3:
                 over_2_5 += prob
+            if x >= 1 and y >= 1:
+                btts_yes += prob
 
     # Olasılığa göre azalan; eşitlikte beklenen gole yakınlığa göre deterministik sıralama
     scored_cells.sort(
@@ -228,18 +304,73 @@ def predict_score_distribution(
 
     best_prob, pred_home, pred_away = scored_cells[0]
     top_scores = [
-        ScoreProbability(score=f"{x}-{y}", prob=round(prob, 4))
+        ScoreProbability.model_construct(score=f"{x}-{y}", prob=round(prob, 4))
         for prob, x, y in scored_cells[: max(1, top_k)]
     ]
 
-    dominant_outcome = max(home_win, draw, away_win)
-    confidence = calculate_confidence_rate(
-        best_prob,
-        dominant_outcome,
-        sample_matches=sample_matches,
-    )
+    model_ph, model_pd, model_pa = _normalize_1x2(home_win, draw, away_win)
+    raw_ph, raw_pd, raw_pa = model_ph, model_pd, model_pa
+    raw_over25 = min(1.0, max(0.0, over_2_5))
+    raw_btts_yes = min(1.0, max(0.0, btts_yes))
 
-    # İki aşamalı (İlk Yarı + İkinci Yarı) ortak dağılım ve İY/MS olasılıkları
+    market_blended = False
+    effective_alpha = 0.0
+    if market_probs is not None:
+        cand_alpha = (
+            DEFAULT_MARKET_BLEND_ALPHA
+            if market_blend_alpha is None
+            else float(market_blend_alpha)
+        )
+        if math.isfinite(cand_alpha) and cand_alpha > 0.0:
+            alpha = min(1.0, max(0.0, cand_alpha))
+            m_h = _extract_finite_prob(market_probs, "p_home", "home_prob", "prob_home")
+            m_d = _extract_finite_prob(market_probs, "p_draw", "draw_prob", "prob_draw")
+            m_a = _extract_finite_prob(market_probs, "p_away", "away_prob", "prob_away")
+            if m_h is not None and m_d is not None and m_a is not None and m_h > 0.0 and m_d > 0.0 and m_a > 0.0:
+                mh_n, md_n, ma_n = _normalize_1x2(m_h, m_d, m_a)
+                raw_ph, raw_pd, raw_pa = _normalize_1x2(
+                    (1.0 - alpha) * model_ph + alpha * mh_n,
+                    (1.0 - alpha) * model_pd + alpha * md_n,
+                    (1.0 - alpha) * model_pa + alpha * ma_n,
+                )
+                market_blended = True
+                effective_alpha = round(alpha, 4)
+
+                m_over25 = _extract_finite_prob(
+                    market_probs, "p_over25", "over_25_prob", "over25_prob"
+                )
+                if m_over25 is not None and 0.0 < m_over25 < 1.0:
+                    cand_ou = alpha if market_blend_alpha_ou is None else float(market_blend_alpha_ou)
+                    alpha_ou = min(1.0, max(0.0, cand_ou)) if math.isfinite(cand_ou) else alpha
+                    raw_over25 = min(
+                        1.0, max(0.0, (1.0 - alpha_ou) * raw_over25 + alpha_ou * m_over25)
+                    )
+
+                m_btts = _extract_finite_prob(market_probs, "p_btts_yes", "btts_yes_prob")
+                if m_btts is not None and 0.0 < m_btts < 1.0:
+                    raw_btts_yes = min(1.0, max(0.0, (1.0 - alpha) * raw_btts_yes + alpha * m_btts))
+
+    bp_home, bp_draw, bp_away = _round_basis_points((raw_ph, raw_pd, raw_pa), 10000, (0, 1, 2))
+    p_home = round(bp_home / 10000.0, 4)
+    p_draw = round(bp_draw / 10000.0, 4)
+    p_away = round(bp_away / 10000.0, 4)
+
+    p_over25 = round(raw_over25, 4)
+    p_under25 = round(max(0.0, 1.0 - p_over25), 4)
+    p_btts_yes = round(raw_btts_yes, 4)
+    p_btts_no = round(max(0.0, 1.0 - p_btts_yes), 4)
+
+    if market_blended:
+        confidence = round(1.0 - normalized_shannon_entropy_1x2(raw_ph, raw_pd, raw_pa), 4)
+    else:
+        dominant_outcome = max(raw_ph, raw_pd, raw_pa)
+        confidence = calculate_confidence_rate(
+            best_prob,
+            dominant_outcome,
+            sample_matches=sample_matches,
+        )
+
+    # İki aşamalı (İlk Yarı + İkinci Yarı) ortak dağılım ve 9 yönlü marjinal tutarlı İY/MS olasılıkları
     raw_sh = (
         home_ht_share
         if home_ht_share is not None
@@ -266,39 +397,61 @@ def predict_score_distribution(
         lam_2h, mu_2h, min_xg=MIN_HALF_EXPECTED_GOALS, max_goals=max_goals, rho=half_rho
     )
 
-    ht_ft_mass: dict[str, float] = {code: 0.0 for code in _HT_FT_TIE_ORDER}
+    ht_ft_mass: dict[str, float] = {code: 0.0 for code in ALL_HT_FT_CODES}
     total_joint_mass = 0.0
     for h1 in range(max_goals + 1):
-        for h2 in range(max_goals + 1 - h1):
-            ft_h = h1 + h2
-            for a1 in range(max_goals + 1):
-                p_ht = ht_matrix[h1][a1]
-                ht_sign = _outcome_sign(h1, a1)
-                for a2 in range(max_goals + 1 - a1):
-                    ft_a = a1 + a2
-                    joint_p = p_ht * sh_matrix[h2][a2]
-                    code = f"{ht_sign}/{_outcome_sign(ft_h, ft_a)}"
-                    ht_ft_mass[code] += joint_p
-                    total_joint_mass += joint_p
+        ht_row = ht_matrix[h1]
+        max_h2 = max_goals - h1
+        for a1 in range(max_goals + 1):
+            p_ht = ht_row[a1]
+            if p_ht <= 0.0:
+                continue
+            ht_sign = "1" if h1 > a1 else ("X" if h1 == a1 else "2")
+            max_a2_excl = max_goals + 1 - a1
+            diff = h1 - a1
+            m1 = mx = m2 = 0.0
+            for h2 in range(max_h2 + 1):
+                sh_row = sh_matrix[h2]
+                eq_a2 = h2 + diff
+                if eq_a2 > 0:
+                    m1 += sum(sh_row[: min(max_a2_excl, eq_a2)])
+                if 0 <= eq_a2 < max_a2_excl:
+                    mx += sh_row[eq_a2]
+                if eq_a2 + 1 < max_a2_excl:
+                    m2 += sum(sh_row[max(0, eq_a2 + 1) : max_a2_excl])
+            ht_ft_mass[f"{ht_sign}/1"] += p_ht * m1
+            ht_ft_mass[f"{ht_sign}/X"] += p_ht * mx
+            ht_ft_mass[f"{ht_sign}/2"] += p_ht * m2
+            total_joint_mass += p_ht * (m1 + mx + m2)
 
     if total_joint_mass > 0.0:
         ht_ft_probs = {code: mass / total_joint_mass for code, mass in ht_ft_mass.items()}
     else:
-        ht_ft_probs = {code: (1.0 if code == "X/X" else 0.0) for code in _HT_FT_TIE_ORDER}
+        ht_ft_probs = {code: (1.0 if code == "X/X" else 0.0) for code in ALL_HT_FT_CODES}
+
+    rounded_ht_ft: dict[str, float] = {}
+    for ft_sign, bp_target in (("1", bp_home), ("X", bp_draw), ("2", bp_away)):
+        grp_codes = (f"1/{ft_sign}", f"X/{ft_sign}", f"2/{ft_sign}")
+        grp_raw = [ht_ft_probs[c] for c in grp_codes]
+        grp_ties = [ALL_HT_FT_CODES.index(c) for c in grp_codes]
+        grp_bps = _round_basis_points(grp_raw, bp_target, grp_ties)
+        for c, bp in zip(grp_codes, grp_bps, strict=True):
+            rounded_ht_ft[c] = round(bp / 10000.0, 4)
 
     ranked_ht_ft = sorted(
-        ht_ft_probs.items(),
-        key=lambda item: (-item[1], _HT_FT_TIE_ORDER.index(item[0])),
+        ALL_HT_FT_CODES,
+        key=lambda code: (-rounded_ht_ft[code], ALL_HT_FT_CODES.index(code)),
     )
-    ht_ft_prediction = ranked_ht_ft[0][0]
-    top_ht_ft = [
-        HtFtProbability(
+    all_ht_ft = [
+        HtFtProbability.model_construct(
             code=code,
             label=HT_FT_LABELS_TR[code],
-            prob=round(prob, 4),
+            prob=rounded_ht_ft[code],
         )
-        for code, prob in ranked_ht_ft[: max(1, top_k)]
+        for code in ranked_ht_ft
     ]
+    ht_ft_prediction = all_ht_ft[0].code
+    top_ht_ft = all_ht_ft[: max(1, top_k)]
 
     # Garantili 0 <= h1 <= pred_home ve 0 <= a1 <= pred_away alt kümesinde en olası İY skoru
     valid_splits: list[tuple[float, int, int]] = []
@@ -334,14 +487,21 @@ def predict_score_distribution(
         predicted_away_score=pred_away,
         top_scores=top_scores,
         confidence_rate=confidence,
-        home_win_prob=round(home_win, 4),
-        draw_prob=round(draw, 4),
-        away_win_prob=round(away_win, 4),
-        over_2_5_prob=round(over_2_5, 4),
+        home_win_prob=p_home,
+        draw_prob=p_draw,
+        away_win_prob=p_away,
+        over_2_5_prob=p_over25,
         expected_ht_home_goals=round(lam_ht, 4),
         expected_ht_away_goals=round(mu_ht, 4),
         predicted_ht_home_score=pred_ht_home,
         predicted_ht_away_score=pred_ht_away,
         ht_ft_prediction=ht_ft_prediction,
         top_ht_ft=top_ht_ft,
+        all_ht_ft=all_ht_ft,
+        over_25_prob=p_over25,
+        under_25_prob=p_under25,
+        btts_yes_prob=p_btts_yes,
+        btts_no_prob=p_btts_no,
+        market_blended=market_blended,
+        market_blend_weight=effective_alpha,
     )

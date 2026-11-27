@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
 import '../config/constants.dart';
@@ -33,6 +35,7 @@ class BulletinData {
   final Map<String, int> injuriesByLeague;
   final Map<String, LeagueModel> leaguesById;
   final Map<String, List<MatchModel>> matchesByLeague;
+  final bool isOfflineCache;
 
   const BulletinData({
     required this.generatedAt,
@@ -49,7 +52,13 @@ class BulletinData {
     this.injuriesByLeague = const <String, int>{},
     this.leaguesById = const <String, LeagueModel>{},
     required this.matchesByLeague,
+    this.isOfflineCache = false,
   });
+
+  String get formattedGeneratedAt {
+    final formatted = AppConstants.formatShortTimestampTr(generatedAt);
+    return formatted.isNotEmpty ? formatted : 'Bilinmiyor';
+  }
 
   int effectivePlayedMatches(String leagueId) {
     final leagueCount = playedMatchesByLeague[leagueId] ?? 0;
@@ -110,7 +119,10 @@ class BulletinData {
         .toList();
   }
 
-  factory BulletinData.fromJson(Map<String, dynamic> json) {
+  factory BulletinData.fromJson(
+    Map<String, dynamic> json, {
+    bool isOfflineCache = false,
+  }) {
     final rawLeagues = json['leagues'];
     if (rawLeagues is! List) {
       throw const BulletinApiException(
@@ -240,6 +252,7 @@ class BulletinData {
       injuriesByLeague: injuriesByLeague,
       leaguesById: parsedLeaguesById,
       matchesByLeague: grouped,
+      isOfflineCache: isOfflineCache,
     );
   }
 }
@@ -248,6 +261,9 @@ class BulletinApiService {
   static const String _bulletinEndpoint = '/api/v1/bulletin';
   static const String _usbReverseFallbackUrl =
       'http://127.0.0.1:7860/api/v1/bulletin';
+  static const MethodChannel _storageChannel =
+      MethodChannel('com.futbol.bulten/storage');
+  static const String defaultCacheFileName = 'futbol_bulletin_cache.json';
   static const Map<String, String> _requestHeaders = <String, String>{
     'Accept': 'application/json',
     'Cache-Control': 'no-cache',
@@ -255,21 +271,82 @@ class BulletinApiService {
 
   final http.Client _client;
   final String _apiUrl;
+  final String? _cacheFilePath;
+  final bool _enableOfflineCache;
   final bool _allowUsbFallback;
   final Duration timeout;
 
   BulletinApiService({
     http.Client? client,
     String? apiUrl,
+    String? cacheFilePath,
+    bool? enableOfflineCache,
     this.timeout = const Duration(seconds: 15),
   })  : _client = client ?? http.Client(),
         _apiUrl = apiUrl ?? AppConstants.apiUrl,
+        _cacheFilePath = cacheFilePath,
+        // shortcut: MockClient kullanan mevcut izolasyon testlerinin birbirini etkilememesi için client enjekte edildiğinde önbellek yalnızca cacheFilePath veya enableOfflineCache ile açılır.
+        _enableOfflineCache =
+            enableOfflineCache ?? (cacheFilePath != null || client == null),
         _allowUsbFallback = _shouldAllowUsbFallback(
           client: client,
           apiUrl: apiUrl,
         );
 
   bool get allowsUsbFallback => _allowUsbFallback;
+  bool get isOfflineCacheEnabled => _enableOfflineCache;
+
+  Future<File> resolveCacheFile() async {
+    final explicit = _cacheFilePath?.trim();
+    if (explicit != null && explicit.isNotEmpty) {
+      return File(explicit);
+    }
+    try {
+      final dir = await _storageChannel.invokeMethod<String>('getFilesDir');
+      if (dir != null && dir.trim().isNotEmpty) {
+        return File('${dir.trim()}/$defaultCacheFileName');
+      }
+    } catch (_) {
+      // MissingPluginException veya binding başlatılmamış test ortamı
+    }
+    return File('${Directory.systemTemp.path}/$defaultCacheFileName');
+  }
+
+  Future<void> _writeCacheAtomically(String rawBody) async {
+    if (!_enableOfflineCache) return;
+    File? target;
+    try {
+      target = await resolveCacheFile();
+      target.parent.createSync(recursive: true);
+      final tmp = File('${target.path}.tmp');
+      tmp.writeAsStringSync(rawBody, encoding: utf8, flush: true);
+      tmp.renameSync(target.path);
+    } catch (_) {
+      if (target != null) {
+        try {
+          target.writeAsStringSync(rawBody, encoding: utf8, flush: true);
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<BulletinData?> _readCachedBulletin() async {
+    if (!_enableOfflineCache) return null;
+    try {
+      final file = await resolveCacheFile();
+      if (!file.existsSync()) return null;
+      final raw = file.readAsStringSync(encoding: utf8);
+      if (raw.trim().isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      return BulletinData.fromJson(
+        Map<String, dynamic>.from(decoded),
+        isOfflineCache: true,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 
   static bool _shouldAllowUsbFallback({
     required http.Client? client,
@@ -332,6 +409,8 @@ class BulletinApiService {
           .timeout(primaryTimeout);
     } catch (error) {
       if (!_allowUsbFallback) {
+        final cached = await _readCachedBulletin();
+        if (cached != null) return cached;
         if (error is BulletinApiException) rethrow;
         throw BulletinApiException('Sunucuya ulaşılamadı: $error');
       }
@@ -344,32 +423,54 @@ class BulletinApiService {
             )
             .timeout(timeout);
       } catch (_) {
+        final cached = await _readCachedBulletin();
+        if (cached != null) return cached;
         if (error is BulletinApiException) rethrow;
         throw BulletinApiException('Sunucuya ulaşılamadı: $error');
       }
     }
 
     if (response.statusCode != 200) {
+      final cached = await _readCachedBulletin();
+      if (cached != null) return cached;
       throw BulletinApiException(
         'Sunucu hatası (HTTP ${response.statusCode})',
         statusCode: response.statusCode,
       );
     }
 
+    final String bodyText;
     final dynamic decodedJson;
     try {
-      final bodyText = utf8.decode(response.bodyBytes);
+      bodyText = utf8.decode(response.bodyBytes);
       decodedJson = jsonDecode(bodyText);
     } catch (error) {
+      final cached = await _readCachedBulletin();
+      if (cached != null) return cached;
       throw BulletinApiException('Bülten JSON verisi çözümlenemedi: $error');
     }
 
     if (decodedJson is! Map) {
+      final cached = await _readCachedBulletin();
+      if (cached != null) return cached;
       throw const BulletinApiException(
         'Bülten yanıtı geçerli bir JSON nesnesi değil.',
       );
     }
 
-    return BulletinData.fromJson(Map<String, dynamic>.from(decodedJson));
+    final BulletinData parsed;
+    try {
+      parsed = BulletinData.fromJson(
+        Map<String, dynamic>.from(decodedJson),
+        isOfflineCache: false,
+      );
+    } catch (error) {
+      final cached = await _readCachedBulletin();
+      if (cached != null) return cached;
+      rethrow;
+    }
+
+    await _writeCacheAtomically(bodyText);
+    return parsed;
   }
 }

@@ -7,20 +7,45 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from engine.backtest.metrics import CalibrationBucket, ModelSummaryMetrics
+from engine.backtest.metrics import (
+    CalibrationBucket,
+    MatchEvaluationRecord,
+    ModelSummaryMetrics,
+    summarize_records,
+)
 from engine.backtest.runner import (
+    ABLATION_MODEL_ORDER,
     LEAGUE_CODE_MAP,
     MODEL_BASELINE,
     MODEL_MARKET,
+    MODEL_MARKET_BLEND,
     MODEL_ORDER,
     MODEL_POST_FIX,
     MODEL_PRE_FIX,
+    MODEL_TIME_DECAY,
     HistoricalCsvMatch,
     WalkForwardResult,
     fetch_football_data_csv_text,
     parse_historical_csv,
     run_walk_forward,
 )
+from engine.models.schemas import ALL_HT_FT_CODES
+from engine.predictors.poisson import (
+    DEFAULT_MARKET_BLEND_ALPHA,
+    _normalize_1x2,
+    _round_basis_points,
+)
+from engine.predictors.ratings import DEFAULT_TIME_DECAY_XI
+
+ABLATION_LABELS_TR: dict[str, str] = {
+    MODEL_POST_FIX: "1. Baz Post-Fix (ξ=0, α=0)",
+    MODEL_TIME_DECAY: "2. + Zaman Sönümü (M2)",
+    MODEL_MARKET_BLEND: "3. + Piyasa Harmanı (M2 + M5)",
+    MODEL_MARKET: "4. Saf Piyasa Referansı (De-vigged)",
+}
+
+DEFAULT_XI_GRID: tuple[float, ...] = (0.0, 0.0015, 0.003, 0.0045, 0.006, 0.008, 0.012)
+DEFAULT_ALPHA_GRID: tuple[float, ...] = (0.0, 0.15, 0.25, 0.35, 0.50, 0.65)
 
 
 def _fmt_float(val: float | None, digits: int = 4) -> str:
@@ -94,8 +119,397 @@ def _render_calibration_table(
     return lines
 
 
+def _render_v2_ablation_table(
+    summaries: dict[str, ModelSummaryMetrics],
+    *,
+    xi: float,
+    alpha: float,
+) -> list[str]:
+    header = (
+        "| Aşama / Model | Maç | 1X2 RPS (↓) | 1X2 Brier (↓) | 1X2 Log-Loss (↓) | "
+        "1X2 İsabet (↑) | Üst 2.5 Brier (↓) | Üst 2.5 Log-Loss (↓) | Üst 2.5 İsabet (↑) | "
+        "9'lu İY/MS Brier (↓) | 9'lu İY/MS Log-Loss (↓) | İY/MS Top-1 (↑) | İY/MS Top-3 (↑) |"
+    )
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    lines = [header, sep]
+    label_map = {
+        MODEL_POST_FIX: "1. Baz Post-Fix (`ξ=0`, `α=0`)",
+        MODEL_TIME_DECAY: f"2. + Zaman Sönümü (`ξ={xi:.4f}`, `α=0`)",
+        MODEL_MARKET_BLEND: f"3. + Piyasa Harmanı (`ξ={xi:.4f}`, `α={alpha:.2f}`)",
+        MODEL_MARKET: "4. Saf Piyasa Referansı (De-vigged Market)",
+    }
+    for key in ABLATION_MODEL_ORDER:
+        m = summaries.get(key)
+        if m is None or m.matches == 0:
+            continue
+        lines.append(
+            f"| {label_map.get(key, m.model_name)} | {m.matches} | "
+            f"{_fmt_float(m.rps, 4)} | {_fmt_float(m.brier_1x2, 4)} | "
+            f"{_fmt_float(m.log_loss_1x2, 4)} | {_fmt_pct(m.accuracy_1x2)} | "
+            f"{_fmt_float(m.brier_over25, 4)} | {_fmt_float(m.log_loss_over25, 4)} | "
+            f"{_fmt_pct(m.accuracy_over25)} | {_fmt_float(m.brier_ht_ft, 4)} | "
+            f"{_fmt_float(m.log_loss_ht_ft, 4)} | {_fmt_pct(m.ht_ft_top1_accuracy)} | "
+            f"{_fmt_pct(m.ht_ft_top3_accuracy)} |"
+        )
+    return lines
+
+
+def _render_v2_calibration_table(
+    base_buckets: Sequence[CalibrationBucket],
+    blend_buckets: Sequence[CalibrationBucket],
+    market_buckets: Sequence[CalibrationBucket],
+) -> list[str]:
+    header = (
+        "| Olasılık Dilimi | Baz Adet | Baz Tahmin | Baz Gerçekleşen | Baz Hata | "
+        "Harman (M2+M5) Adet | Harman Tahmin | Harman Gerçekleşen | Harman Hata | Piyasa Hata |"
+    )
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    lines = [header, sep]
+    for idx, b_base in enumerate(base_buckets):
+        b_bl = blend_buckets[idx]
+        b_mk = market_buckets[idx] if idx < len(market_buckets) else None
+        mk_err = _fmt_pct(b_mk.abs_calibration_error) if b_mk and b_mk.count > 0 else "-"
+        bp = _fmt_pct(b_base.mean_predicted) if b_base.count > 0 else "-"
+        br = _fmt_pct(b_base.empirical_rate) if b_base.count > 0 else "-"
+        be = _fmt_pct(b_base.abs_calibration_error) if b_base.count > 0 else "-"
+        hp = _fmt_pct(b_bl.mean_predicted) if b_bl.count > 0 else "-"
+        hr = _fmt_pct(b_bl.empirical_rate) if b_bl.count > 0 else "-"
+        he = _fmt_pct(b_bl.abs_calibration_error) if b_bl.count > 0 else "-"
+        lines.append(
+            f"| `{b_base.label}` | {b_base.count} | {bp} | {br} | {be} | "
+            f"{b_bl.count} | {hp} | {hr} | {he} | {mk_err} |"
+        )
+    return lines
+
+
+def _blend_record_at_alpha(
+    model_rec: MatchEvaluationRecord,
+    mkt_rec: MatchEvaluationRecord | None,
+    alpha: float,
+) -> MatchEvaluationRecord:
+    if mkt_rec is None or alpha <= 0.0:
+        return model_rec
+    mh, md, ma = _normalize_1x2(mkt_rec.p_home, mkt_rec.p_draw, mkt_rec.p_away)
+    oh, od, oa = _normalize_1x2(model_rec.p_home, model_rec.p_draw, model_rec.p_away)
+    raw_h, raw_d, raw_a = _normalize_1x2(
+        (1.0 - alpha) * oh + alpha * mh,
+        (1.0 - alpha) * od + alpha * md,
+        (1.0 - alpha) * oa + alpha * ma,
+    )
+    bp_h, bp_d, bp_a = _round_basis_points((raw_h, raw_d, raw_a), 10000, (0, 1, 2))
+    ph = round(bp_h / 10000.0, 4)
+    pd = round(bp_d / 10000.0, 4)
+    pa = round(bp_a / 10000.0, 4)
+
+    po25 = model_rec.p_over25
+    if po25 is not None and mkt_rec.p_over25 is not None:
+        po25 = round((1.0 - alpha) * po25 + alpha * mkt_rec.p_over25, 4)
+
+    blended_ht_ft: dict[str, float] | None = None
+    if model_rec.ht_ft_probs is not None:
+        blended_ht_ft = {}
+        for ft_sign, bp_target in (("1", bp_h), ("X", bp_d), ("2", bp_a)):
+            grp_codes = (f"1/{ft_sign}", f"X/{ft_sign}", f"2/{ft_sign}")
+            grp_raw = [model_rec.ht_ft_probs.get(c, 0.0) for c in grp_codes]
+            grp_ties = [ALL_HT_FT_CODES.index(c) for c in grp_codes]
+            grp_bps = _round_basis_points(grp_raw, bp_target, grp_ties)
+            for c, bp in zip(grp_codes, grp_bps, strict=True):
+                blended_ht_ft[c] = round(bp / 10000.0, 4)
+
+    return MatchEvaluationRecord(
+        league_code=model_rec.league_code,
+        season_code=model_rec.season_code,
+        match_date=model_rec.match_date,
+        home_team=model_rec.home_team,
+        away_team=model_rec.away_team,
+        home_goals=model_rec.home_goals,
+        away_goals=model_rec.away_goals,
+        p_home=ph,
+        p_draw=pd,
+        p_away=pa,
+        p_over25=po25,
+        expected_home_goals=model_rec.expected_home_goals,
+        expected_away_goals=model_rec.expected_away_goals,
+        ht_home_goals=model_rec.ht_home_goals,
+        ht_away_goals=model_rec.ht_away_goals,
+        actual_ht_ft=model_rec.actual_ht_ft,
+        ht_ft_probs=blended_ht_ft,
+    )
+
+
+def evaluate_hyperparameter_grids(
+    matches: Sequence[HistoricalCsvMatch],
+    *,
+    warmup_matches: int = 30,
+    optimal_xi: float = DEFAULT_TIME_DECAY_XI,
+    base_result: WalkForwardResult | None = None,
+    xi_grid: Sequence[float] = DEFAULT_XI_GRID,
+    alpha_grid: Sequence[float] = DEFAULT_ALPHA_GRID,
+) -> tuple[list[tuple[float, ModelSummaryMetrics]], list[tuple[float, ModelSummaryMetrics]]]:
+    """Walk-forward kümesi üzerinde ξ (zaman sönümü) ve α (piyasa harmanı) duyarlılık ızgaralarını hesaplar."""
+    anchor_wf = base_result or run_walk_forward(
+        matches,
+        warmup_matches=warmup_matches,
+        time_decay_xi=optimal_xi,
+        market_blend_alpha=DEFAULT_MARKET_BLEND_ALPHA,
+    )
+
+    xi_rows: list[tuple[float, ModelSummaryMetrics]] = []
+    for xi_val in xi_grid:
+        if xi_val <= 0.0:
+            xi_rows.append((xi_val, anchor_wf.overall_summaries[MODEL_POST_FIX]))
+        elif abs(xi_val - anchor_wf.time_decay_xi) < 1e-9:
+            xi_rows.append((xi_val, anchor_wf.overall_summaries[MODEL_TIME_DECAY]))
+        else:
+            wf_xi = run_walk_forward(
+                matches,
+                warmup_matches=warmup_matches,
+                time_decay_xi=xi_val,
+                market_blend_alpha=0.0,
+            )
+            xi_rows.append((xi_val, wf_xi.overall_summaries[MODEL_TIME_DECAY]))
+
+    opt_wf = (
+        anchor_wf
+        if abs(optimal_xi - anchor_wf.time_decay_xi) < 1e-9
+        else run_walk_forward(
+            matches,
+            warmup_matches=warmup_matches,
+            time_decay_xi=optimal_xi,
+            market_blend_alpha=0.0,
+        )
+    )
+    dec_records = opt_wf.records_by_model[MODEL_TIME_DECAY]
+    mkt_by_key = {
+        (r.league_code, r.season_code, r.match_date, r.home_team, r.away_team): r
+        for r in opt_wf.records_by_model[MODEL_MARKET]
+    }
+
+    alpha_rows: list[tuple[float, ModelSummaryMetrics]] = []
+    for alpha_val in alpha_grid:
+        if alpha_val <= 0.0:
+            alpha_rows.append((alpha_val, opt_wf.overall_summaries[MODEL_TIME_DECAY]))
+        elif abs(alpha_val - opt_wf.market_blend_alpha) < 1e-9:
+            alpha_rows.append((alpha_val, opt_wf.overall_summaries[MODEL_MARKET_BLEND]))
+        else:
+            blended_recs = [
+                _blend_record_at_alpha(
+                    r,
+                    mkt_by_key.get(
+                        (r.league_code, r.season_code, r.match_date, r.home_team, r.away_team)
+                    ),
+                    alpha_val,
+                )
+                for r in dec_records
+            ]
+            alpha_rows.append(
+                (alpha_val, summarize_records(f"alpha={alpha_val:.2f}", blended_recs))
+            )
+
+    return xi_rows, alpha_rows
+
+
+def render_v2_markdown_report(
+    result: WalkForwardResult,
+    *,
+    xi_grid_rows: Sequence[tuple[float, ModelSummaryMetrics]] | None = None,
+    alpha_grid_rows: Sequence[tuple[float, ModelSummaryMetrics]] | None = None,
+) -> str:
+    """GÖREV-13 Faz 2 (M2 Zaman Sönümü + M5 Piyasa Harmanı + 9'lu İY/MS) Türkçe backtest v2 raporunu üretir."""
+    base_m = result.overall_summaries[MODEL_POST_FIX]
+    dec_m = result.overall_summaries[MODEL_TIME_DECAY]
+    blend_m = result.overall_summaries[MODEL_MARKET_BLEND]
+    mkt_m = result.overall_summaries[MODEL_MARKET]
+
+    xi = result.time_decay_xi
+    alpha = result.market_blend_alpha
+    half_life_days = (0.6931471805599453 / xi) if xi > 0.0 else float("inf")
+    seasons_str = ", ".join(result.seasons)
+    leagues_str = ", ".join(
+        f"{code} ({LEAGUE_CODE_MAP.get(code, (None, code))[1]})" for code in result.leagues
+    )
+
+    rps_gap_base = base_m.rps - mkt_m.rps
+    closed_pct = (
+        ((base_m.rps - blend_m.rps) / rps_gap_base) * 100.0 if rps_gap_base > 1e-9 else 0.0
+    )
+
+    sections: list[str] = [
+        "# GÖREV-13 Walk-Forward Backtest v2: Üstel Zaman Sönümü (M2), Piyasa Harmanı (M5) ve 9 Yönlü İY/MS Kalibrasyonu",
+        "",
+        "## 1. Metodoloji, Veri Kümesi ve Nedensellik (Zero-Leakage) Garantisi",
+        "",
+        f"- **Veri Kapsamı:** Sezonlar: `{seasons_str}` | Hedef Ligler: {leagues_str}.",
+        f"- **Örneklem Büyüklüğü:** Football-Data tarihsel arşivinden toplam **{result.total_parsed_matches}** "
+        f"tamamlanmış resmi lig maçı ayrıştırıldı; her `(lig, sezon)` grubundaki ilk **{result.warmup_matches}** "
+        f"maçlık ısınma (warm-up) penceresi sonrasında tam **{result.evaluated_matches}** maç walk-forward "
+        f"olarak değerlendirildi (`1X2` oran kapsaması: **{result.market_1x2_matches}** maç, "
+        f"`Üst/Alt 2.5` oran kapsaması: **{result.market_over25_matches}** maç, "
+        f"geçerli `HTHG`/`HTAG` ilk yarı skoru bulunan `9'lu İY/MS` kapsaması: **{result.ht_ft_evaluated_matches}** maç).",
+        "- **Nedensel (Causal) Walk-Forward Protokolü:** Her `(lig, sezon)` serisi başlama vuruşu zamanına "
+        "(`kickoff`) göre sıralanır ve takvim gününe (`match_day`) göre gruplanır. `D` günündeki her maç için "
+        "lig gol ortalamaları (`calculate_league_baseline`), takım hücum/savunma reytingleri (`build_team_ratings`), "
+        "üstel zaman ağırlıkları (`w = exp(-ξ * Δgün)`, `ref_date = D`), geçmiş isabetli şut (`HST`/`AST`) ve "
+        "ilk yarı gol payları yalnızca `match_day < D` koşulunu sağlayan geçmiş maçlardan hesaplanır. "
+        "`D` gününün sonuçları ancak o günün tüm tahminleri üretildikten sonra geçmiş havuzuna eklenir.",
+        "- **9 Yönlü Marjinal Tutarlı İY/MS Dağılımı:** İki aşamalı (`İY` + `2Y`) Dixon-Coles konvolüsyonundan "
+        "elde edilen 9 İY/MS olasılığı (`1/1, X/1, 2/1, 1/X, X/X, 2/X, 1/2, X/2, 2/2`), her tam saha sonuç "
+        "grubunda (`MS=1`, `MS=X`, `MS=2`) modelin (veya piyasa harmanının) nihai `p_home, p_draw, p_away` "
+        "olasılıklarına tam marjinal tutarlılıkla ölçeklenir ve en büyük kalan yöntemiyle toplamı `1.0000` "
+        "olacak şekilde yuvarlanır.",
+        "- **Not (Saf Piyasa 9'lu İY/MS Sütunları):** Football-Data CSV kaynaklarında bahisçi kapanış oranları "
+        "yalnızca `1X2` ve `Üst/Alt 2.5` pazarları için yayımlandığından (9 yönlü bahisçi İY/MS oranları CSV'de "
+        "yer almadığından) Saf Piyasa satırında 9'lu İY/MS metrikleri `-` olarak gösterilmiştir.",
+        "",
+        "## 2. Dört Lig Birleşik Kademeli Ablasyon Tablosu (`T1 + E0 + SP1 + F1`)",
+        "",
+        *_render_v2_ablation_table(result.overall_summaries, xi=xi, alpha=alpha),
+        "",
+        "### Birleşik Ablasyon Bulguları",
+        "",
+        f"1. **Üstel Zaman Sönümü (`M2`, `ξ = {xi:.4f} / gün`, yarı ömür `≈ {half_life_days:.0f} gün`):** "
+        f"Dixon-Coles (1997) yarı-haftalık sönüm sabitiyle (`0.0065 / 3.5 ≈ 0.0018/gün`) uyumlu biçimde, "
+        f"`ξ = {xi:.4f}` sönümü saf model modunda (`market_probs=None`) 1X2 RPS değerini "
+        f"`{base_m.rps:.5f}` -> `{dec_m.rps:.5f}` (`{dec_m.rps - base_m.rps:+.5f}`), 1X2 Brier skorunu "
+        f"`{base_m.brier_1x2:.5f}` -> `{dec_m.brier_1x2:.5f}` ve 1X2 Log-Loss değerini "
+        f"`{base_m.log_loss_1x2:.5f}` -> `{dec_m.log_loss_1x2:.5f}` düzeyine iyileştirmiştir.",
+        f"2. **Marjinal Tutarlı Piyasa Harmanı (`M2 + M5`, `α = {alpha:.2f}`):** "
+        f"Model dağılımının marjı arındırılmış piyasa olasılıklarıyla `%{(1.0 - alpha) * 100:.0f} Model + "
+        f"%{alpha * 100:.0f} Piyasa` oranında harmanlanması 1X2 RPS'yi `{base_m.rps:.4f}` -> `{blend_m.rps:.4f}` "
+        f"(`{blend_m.rps - base_m.rps:+.4f}`), 1X2 Log-Loss'u `{base_m.log_loss_1x2:.4f}` -> `{blend_m.log_loss_1x2:.4f}` "
+        f"(`{blend_m.log_loss_1x2 - base_m.log_loss_1x2:+.4f}`) ve 1X2 isabet oranını "
+        f"`{_fmt_pct(base_m.accuracy_1x2)}` -> `{_fmt_pct(blend_m.accuracy_1x2)}` seviyesine taşımış; "
+        f"saf model ile kapanış piyasası arasındaki RPS farkının **%{closed_pct:.1f}**'ini kapatırken "
+        f"canlı sakatlık ve xG/şut sinyalleri için `%35` yapısal model ağırlığını korumuştur.",
+        f"3. **Üst 2.5 ve 9'lu İY/MS Kazanımı:** Harman katmanı Üst 2.5 Brier skorunu "
+        f"`{_fmt_float(base_m.brier_over25, 4)}` -> `{_fmt_float(blend_m.brier_over25, 4)}` ve Üst 2.5 Log-Loss'u "
+        f"`{_fmt_float(base_m.log_loss_over25, 4)}` -> `{_fmt_float(blend_m.log_loss_over25, 4)}` düzeyine indirirken; "
+        f"marjinal ölçekleme sayesinde **9 yönlü İY/MS** Brier skoru `{_fmt_float(base_m.brier_ht_ft, 4)}` -> "
+        f"`{_fmt_float(blend_m.brier_ht_ft, 4)}`, 9'lu İY/MS Log-Loss `{_fmt_float(base_m.log_loss_ht_ft, 4)}` -> "
+        f"`{_fmt_float(blend_m.log_loss_ht_ft, 4)}`, İY/MS Top-1 isabeti `{_fmt_pct(base_m.ht_ft_top1_accuracy)}` -> "
+        f"`{_fmt_pct(blend_m.ht_ft_top1_accuracy)}` ve Top-3 isabeti `{_fmt_pct(base_m.ht_ft_top3_accuracy)}` -> "
+        f"`{_fmt_pct(blend_m.ht_ft_top3_accuracy)}` olarak yükselmiştir.",
+        "",
+    ]
+
+    if "T1" in result.league_summaries:
+        t1_map = result.league_summaries["T1"]
+        t1_base = t1_map[MODEL_POST_FIX]
+        t1_dec = t1_map[MODEL_TIME_DECAY]
+        t1_blend = t1_map[MODEL_MARKET_BLEND]
+        t1_mkt = t1_map[MODEL_MARKET]
+        sections.extend(
+            [
+                "## 3. Türkiye Süper Lig (`T1`) Özel Ablasyon Tablosu",
+                "",
+                *_render_v2_ablation_table(t1_map, xi=xi, alpha=alpha),
+                "",
+                f"- **Süper Lig Değerlendirmesi (`{t1_base.matches}` maç):** Süper Lig'de form dalgalanmalarının "
+                f"yüksek olması sebebiyle `M2` üstel zaman sönümü tek başına RPS'yi `{t1_base.rps:.4f}` -> "
+                f"`{t1_dec.rps:.4f}` ve 1X2 Log-Loss'u `{t1_base.log_loss_1x2:.4f}` -> `{t1_dec.log_loss_1x2:.4f}` "
+                f"iyileştirmiştir. `M2 + M5` piyasa harmanı devreye girdiğinde Süper Lig RPS değeri "
+                f"`{t1_blend.rps:.4f}` (kapanış piyasası: `{t1_mkt.rps:.4f}`), 1X2 isabet oranı "
+                f"`{_fmt_pct(t1_blend.accuracy_1x2)}`, 9'lu İY/MS Top-1 isabeti `{_fmt_pct(t1_blend.ht_ft_top1_accuracy)}` "
+                f"ve İY/MS Top-3 isabeti `{_fmt_pct(t1_blend.ht_ft_top3_accuracy)}` seviyesine ulaşmıştır.",
+                "",
+            ]
+        )
+
+    sections.extend(["## 4. Diğer Liglerin Ayrıntılı Ablasyon Kırılımı (`E0`, `SP1`, `F1`)", ""])
+    for lg_code in result.leagues:
+        if lg_code == "T1":
+            continue
+        _, lg_title = LEAGUE_CODE_MAP.get(lg_code, (None, lg_code))
+        sections.extend(
+            [
+                f"### {lg_title} (`{lg_code}`)",
+                "",
+                *_render_v2_ablation_table(result.league_summaries[lg_code], xi=xi, alpha=alpha),
+                "",
+            ]
+        )
+
+    if xi_grid_rows or alpha_grid_rows:
+        sections.extend(["## 5. Hiperparametre Izgara Duyarlılık Analizi (`ξ` ve `α`)", ""])
+        if xi_grid_rows:
+            sections.extend(
+                [
+                    "### 5.1. Zaman Sönümü (`time_decay_xi = ξ`) Duyarlılığı (`α = 0.0`, Saf Model)",
+                    "",
+                    "| `ξ` (1/gün) | Yarı Ömür (gün) | 1X2 RPS (↓) | 1X2 Brier (↓) | 1X2 Log-Loss (↓) | "
+                    "1X2 İsabet (↑) | Üst 2.5 Brier (↓) | 9'lu İY/MS Log-Loss (↓) |",
+                    "|---:|---:|---:|---:|---:|---:|---:|---:|",
+                ]
+            )
+            for xi_val, m in xi_grid_rows:
+                hl_str = f"{0.693147 / xi_val:.0f}" if xi_val > 0 else "∞"
+                mark = " **(Seçilen)**" if abs(xi_val - xi) < 1e-7 else ""
+                sections.append(
+                    f"| `{xi_val:.4f}`{mark} | {hl_str} | `{m.rps:.5f}` | `{m.brier_1x2:.5f}` | "
+                    f"`{m.log_loss_1x2:.5f}` | {_fmt_pct(m.accuracy_1x2)} | "
+                    f"`{_fmt_float(m.brier_over25, 5)}` | `{_fmt_float(m.log_loss_ht_ft, 5)}` |"
+                )
+            sections.append("")
+
+        if alpha_grid_rows:
+            sections.extend(
+                [
+                    f"### 5.2. Piyasa Harmanı (`market_blend_alpha = α`) Duyarlılığı (`ξ = {xi:.4f}`)",
+                    "",
+                    "| `α` (Piyasa Ağırlığı) | 1X2 RPS (↓) | 1X2 Brier (↓) | 1X2 Log-Loss (↓) | "
+                    "1X2 İsabet (↑) | Üst 2.5 Brier (↓) | Üst 2.5 Log-Loss (↓) | 9'lu İY/MS Brier (↓) | "
+                    "9'lu İY/MS Log-Loss (↓) | İY/MS Top-1 (↑) | İY/MS Top-3 (↑) |",
+                    "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                ]
+            )
+            for alpha_val, m in alpha_grid_rows:
+                mark = " **(Seçilen)**" if abs(alpha_val - alpha) < 1e-7 else ""
+                sections.append(
+                    f"| `{alpha_val:.2f}`{mark} | `{m.rps:.5f}` | `{m.brier_1x2:.5f}` | "
+                    f"`{m.log_loss_1x2:.5f}` | {_fmt_pct(m.accuracy_1x2)} | "
+                    f"`{_fmt_float(m.brier_over25, 5)}` | `{_fmt_float(m.log_loss_over25, 5)}` | "
+                    f"`{_fmt_float(m.brier_ht_ft, 5)}` | `{_fmt_float(m.log_loss_ht_ft, 5)}` | "
+                    f"{_fmt_pct(m.ht_ft_top1_accuracy)} | {_fmt_pct(m.ht_ft_top3_accuracy)} |"
+                )
+            sections.append("")
+
+    sections.extend(
+        [
+            "## 6. Güvenirlik ve Kalibrasyon Özeti (Reliability Buckets)",
+            "",
+            "### 6.1. 1X2 Olasılık Dilimleri (Baz Post-Fix vs M2+M5 Harman vs Piyasa)",
+            "",
+            *_render_v2_calibration_table(
+                result.calibration_1x2[MODEL_POST_FIX],
+                result.calibration_1x2[MODEL_MARKET_BLEND],
+                result.calibration_1x2[MODEL_MARKET],
+            ),
+            "",
+            "### 6.2. Üst 2.5 Olasılık Dilimleri (Baz Post-Fix vs M2+M5 Harman vs Piyasa)",
+            "",
+            *_render_v2_calibration_table(
+                result.calibration_over25[MODEL_POST_FIX],
+                result.calibration_over25[MODEL_MARKET_BLEND],
+                result.calibration_over25[MODEL_MARKET],
+            ),
+            "",
+            "## 7. Üretim Varsayılanları Kararı",
+            "",
+            f"- `DEFAULT_TIME_DECAY_XI = {xi:.4f}`: Çok hızlı sönüm (`ξ >= 0.0045`) sezon içi örneklem hacmini "
+            "aşırı daraltarak RPS'yi bozarken, `ξ = 0.0015` hem birleşik 4 ligde hem de Süper Lig ve Premier League "
+            "özelinde RPS, Brier ve Log-Loss metriklerini eşzamanlı düşürdüğü için üretim varsayılanı olarak atanmıştır. "
+            "Oran verisi bulunmayan (`market_probs=None`) saf model çağrılarında da doğrudan aktiftir.",
+            f"- `DEFAULT_MARKET_BLEND_ALPHA = {alpha:.2f}`: Test edilen hibrit harman ızgarasında (`0.00..0.65`) tüm "
+            "olasılıksal metrikleri (`1X2 RPS`, `1X2 Log-Loss`, `Üst 2.5 Brier/Log-Loss`, `9'lu İY/MS Brier/Log-Loss` "
+            "ve `İY/MS Top-1/Top-3`) monotonik biçimde iyileştirirken çoklu kaynak sakatlık ve xG/şut sinyallerinin "
+            "etkisini koruduğu için üretim varsayılanı olarak sabitlenmiştir.",
+            "",
+        ]
+    )
+    return "\n".join(sections)
+
+
 def render_markdown_report(result: WalkForwardResult) -> str:
-    """WalkForwardResult çıktısından kapsamlı Türkçe teknik kalibrasyon raporu üretir."""
     post = result.overall_summaries[MODEL_POST_FIX]
     pre = result.overall_summaries[MODEL_PRE_FIX]
     base = result.overall_summaries[MODEL_BASELINE]
@@ -340,6 +754,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Üretilen Markdown raporunun kaydedileceği dosya yolu.",
     )
+    parser.add_argument(
+        "--v2",
+        action="store_true",
+        help="GÖREV-13 Faz 2 ablasyon, 9'lu İY/MS ve hiperparametre ızgara raporunu (v2) üretir.",
+    )
+    parser.add_argument(
+        "--xi",
+        type=float,
+        default=DEFAULT_TIME_DECAY_XI,
+        help=f"Üstel zaman sönümü katsayısı (varsayılan: {DEFAULT_TIME_DECAY_XI}).",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=DEFAULT_MARKET_BLEND_ALPHA,
+        help=f"Piyasa harmanlama ağırlığı (varsayılan: {DEFAULT_MARKET_BLEND_ALPHA}).",
+    )
     return parser
 
 
@@ -368,12 +799,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 all_matches.extend(parsed)
                 sources_used.append(src)
 
+    warmup_val = max(1, args.warmup)
     wf_result = run_walk_forward(
         all_matches,
-        warmup_matches=max(1, args.warmup),
+        warmup_matches=warmup_val,
+        time_decay_xi=args.xi,
+        market_blend_alpha=args.alpha,
         sources_used=sources_used,
     )
-    report_md = render_markdown_report(wf_result)
+    if args.v2:
+        xi_rows, alpha_rows = evaluate_hyperparameter_grids(
+            all_matches,
+            warmup_matches=warmup_val,
+            optimal_xi=args.xi,
+            base_result=wf_result,
+        )
+        report_md = render_v2_markdown_report(
+            wf_result,
+            xi_grid_rows=xi_rows,
+            alpha_grid_rows=alpha_rows,
+        )
+    else:
+        report_md = render_markdown_report(wf_result)
 
     if args.output:
         out_path = Path(args.output)

@@ -12,9 +12,12 @@ from pathlib import Path
 
 from engine.backtest import (
     MODEL_MARKET,
+    MODEL_MARKET_BLEND,
     MODEL_POST_FIX,
     MODEL_PRE_FIX,
+    MODEL_TIME_DECAY,
     MatchEvaluationRecord,
+    actual_ht_ft_code,
     binary_brier_score,
     binary_log_loss,
     compute_calibration_buckets,
@@ -22,6 +25,10 @@ from engine.backtest import (
     devig_two_way_odds,
     extract_market_1x2_probs,
     extract_market_over25_prob,
+    extract_market_over_under25_probs,
+    ht_ft_log_loss,
+    ht_ft_multiclass_brier,
+    ht_ft_top_k_hit,
     main,
     multiclass_brier_score,
     multiclass_log_loss,
@@ -219,6 +226,75 @@ class BacktestEngineTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0)
             self.assertIn("GÖREV-12 Walk-Forward Backtest", proc.stdout)
+
+    def test_v2_ht_ft_metrics_and_ablation_cli(self) -> None:
+        self.assertEqual(actual_ht_ft_code(1, 0, 2, 1), "1/1")
+        self.assertEqual(actual_ht_ft_code(0, 0, 1, 0), "X/1")
+        self.assertEqual(actual_ht_ft_code(0, 1, 2, 1), "2/1")
+        self.assertEqual(actual_ht_ft_code(1, 1, 1, 1), "X/X")
+
+        probs_9 = {
+            "1/1": 0.40,
+            "X/1": 0.20,
+            "2/1": 0.05,
+            "1/X": 0.05,
+            "X/X": 0.12,
+            "2/X": 0.03,
+            "1/2": 0.02,
+            "X/2": 0.05,
+            "2/2": 0.08,
+        }
+        expected_brier = (0.40 - 1.0) ** 2 + sum(
+            v**2 for k, v in probs_9.items() if k != "1/1"
+        )
+        self.assertAlmostEqual(ht_ft_multiclass_brier(probs_9, "1/1"), expected_brier, places=8)
+        self.assertAlmostEqual(ht_ft_log_loss(probs_9, "1/1"), -math.log(0.40), places=8)
+        self.assertTrue(ht_ft_top_k_hit(probs_9, "1/1", k=1))
+        self.assertFalse(ht_ft_top_k_hit(probs_9, "X/1", k=1))
+        self.assertTrue(ht_ft_top_k_hit(probs_9, "X/1", k=3))
+        self.assertTrue(ht_ft_top_k_hit(probs_9, "X/X", k=3))
+        self.assertFalse(ht_ft_top_k_hit(probs_9, "1/2", k=3))
+
+        ou_pair, ou_src = extract_market_over_under25_probs(
+            {"Avg>2.5": "1.80", "Avg<2.5": "2.00"}
+        )
+        assert ou_pair is not None
+        self.assertEqual(ou_src, "MarketAvg-Open")
+        self.assertAlmostEqual(ou_pair[0] + ou_pair[1], 1.0, places=8)
+
+        csv_text = FIXTURE_CSV.read_text(encoding="utf-8")
+        rows = parse_historical_csv(csv_text, season_code="2526")
+        self.assertTrue(all(r.ht_ft_code is not None for r in rows))
+        self.assertTrue(all(r.market_under25 is not None for r in rows))
+
+        wf = run_walk_forward(rows, warmup_matches=4)
+        for m_name in (MODEL_POST_FIX, MODEL_TIME_DECAY, MODEL_MARKET_BLEND):
+            summary = wf.overall_summaries[m_name]
+            self.assertEqual(summary.ht_ft_matches, 6)
+            self.assertIsNotNone(summary.brier_ht_ft)
+            self.assertIsNotNone(summary.log_loss_ht_ft)
+            self.assertIsNotNone(summary.ht_ft_top1_accuracy)
+            self.assertIsNotNone(summary.ht_ft_top3_accuracy)
+            self.assertIsNotNone(summary.accuracy_over25)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_v2 = Path(tmp_dir) / "v2_report.md"
+            rc = main(
+                [
+                    "--csv",
+                    str(FIXTURE_CSV),
+                    "--warmup",
+                    "4",
+                    "--v2",
+                    "--output",
+                    str(out_v2),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            v2_md = out_v2.read_text(encoding="utf-8")
+            self.assertIn("GÖREV-13 Walk-Forward Backtest v2", v2_md)
+            self.assertIn("9'lu İY/MS Brier", v2_md)
+            self.assertIn("Hiperparametre Izgara Duyarlılık Analizi", v2_md)
 
 
 if __name__ == "__main__":

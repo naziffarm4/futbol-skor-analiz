@@ -33,9 +33,7 @@ jobs:
           cache-dependency-path: 'engine/requirements.txt'
 
       - name: Install dependencies
-        run: |
-          pip install -r engine/requirements.txt
-          command -v google-chrome >/dev/null 2>&1 || python -m playwright install --with-deps chromium
+        run: pip install -r engine/requirements.txt
 
       - name: Seed previous bulletin from GitHub Pages
         run: |
@@ -44,12 +42,10 @@ jobs:
           curl -fsSL --max-time 15 "$PAGES_JSON" -o dist/bulletin.json || rm -f dist/bulletin.json
 
       - name: Export weekly football bulletin
-        run: |
-          if command -v xvfb-run >/dev/null 2>&1; then
-            SCRAPER_HEADED=1 xvfb-run -a python -m engine.cli --export-bulletin dist/bulletin.json
-          else
-            python -m engine.cli --export-bulletin dist/bulletin.json
-          fi
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+        run: python -m engine.cli --export-bulletin dist/bulletin.json
 
       - name: Validate bulletin.json and generate static Pages site
         run: |
@@ -84,6 +80,16 @@ jobs:
               raise SystemExit(f"HATA: 4 lig bekleniyordu, bulunan: {len(leagues) if isinstance(leagues, list) else type(leagues).__name__}")
           if total_matches <= 0:
               raise SystemExit(f"HATA: total_matches > 0 olmali, bulunan: {total_matches}")
+
+          for lg in leagues:
+              for m in lg.get("matches", ()):
+                  pred = m.get("prediction") or {}
+                  all_ht_ft = pred.get("all_ht_ft_json") or []
+                  if len(all_ht_ft) != 9:
+                      raise SystemExit(f"HATA: all_ht_ft_json 9 senaryo icermeli, bulunan: {len(all_ht_ft)}")
+                  prob_sum = sum(float(item.get("prob", 0.0)) for item in all_ht_ft)
+                  if abs(prob_sum - 1.0) > 0.002:
+                      raise SystemExit(f"HATA: all_ht_ft_json olasilik toplami ~1.0 olmali, bulunan: {prob_sum}")
 
           (dist_dir / ".nojekyll").write_text("", encoding="utf-8")
 

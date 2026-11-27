@@ -14,6 +14,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from engine.archive import save_snapshot
 from engine.bulletin import export_bulletin_file
 from engine.config import LeagueId, Settings
 from engine.runner import run_full_cycle
@@ -98,11 +99,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         bulletin = export_bulletin_file(cycle, args.export_bulletin)
         total_matches = int(bulletin.get("total_matches", 0))
+        snapshot_path: str | None = None
+        if total_matches > 0:
+            try:
+                snap = save_snapshot(
+                    bulletin,
+                    market_odds=getattr(cycle.ingestion, "market_odds", None),
+                )
+                snapshot_path = str(snap)
+            except Exception as exc:
+                logger.warning("Snapshot kaydedilemedi: %s", exc)
         print(
             json.dumps(
                 {
                     "status": cycle.status,
                     "output_path": str(args.export_bulletin),
+                    "snapshot_path": snapshot_path,
                     "generated_at": bulletin.get("generated_at"),
                     "total_matches": total_matches,
                     "total_played_matches": int(bulletin.get("total_played_matches", 0)),

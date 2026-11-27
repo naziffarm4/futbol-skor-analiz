@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import math
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -18,22 +19,28 @@ from engine.backtest.metrics import (
     CalibrationBucket,
     MatchEvaluationRecord,
     ModelSummaryMetrics,
+    actual_ht_ft_code,
     compute_calibration_buckets,
     extract_market_1x2_probs,
-    extract_market_over25_prob,
+    extract_market_over_under25_probs,
     summarize_records,
 )
 from engine.config import LeagueId
 from engine.models.schemas import Match, MatchStatus
 from engine.predictors.poisson import (
     DEFAULT_DIXON_COLES_RHO,
+    DEFAULT_MARKET_BLEND_ALPHA,
     DEFAULT_MAX_GOALS,
     MAX_EXPECTED_GOALS,
     MIN_EXPECTED_GOALS,
     build_score_matrix,
     predict_score_distribution,
 )
-from engine.predictors.ratings import build_team_ratings, calculate_league_baseline
+from engine.predictors.ratings import (
+    DEFAULT_TIME_DECAY_XI,
+    build_team_ratings,
+    calculate_league_baseline,
+)
 from engine.scrapers.base import build_browser_headers
 
 logger = logging.getLogger(__name__)
@@ -46,14 +53,25 @@ LEAGUE_CODE_MAP: dict[str, tuple[LeagueId, str]] = {
 }
 
 MODEL_POST_FIX = "Post-Fix (Yeni Ölçek, max=10)"
+MODEL_TIME_DECAY = "Post-Fix + Zaman Sönümü (M2)"
+MODEL_MARKET_BLEND = "Post-Fix + Piyasa Harmanı (M2 + M5)"
 MODEL_PRE_FIX = "Pre-Fix (Eski Ölçek, max=5)"
 MODEL_BASELINE = "Lig Ortalaması Sabit Baz"
 MODEL_MARKET = "Piyasa (De-vigged Kapanış)"
 
 MODEL_ORDER: tuple[str, ...] = (
     MODEL_POST_FIX,
+    MODEL_TIME_DECAY,
+    MODEL_MARKET_BLEND,
     MODEL_PRE_FIX,
     MODEL_BASELINE,
+    MODEL_MARKET,
+)
+
+ABLATION_MODEL_ORDER: tuple[str, ...] = (
+    MODEL_POST_FIX,
+    MODEL_TIME_DECAY,
+    MODEL_MARKET_BLEND,
     MODEL_MARKET,
 )
 
@@ -73,6 +91,7 @@ class HistoricalCsvMatch:
     ftag: int
     hthg: int | None = None
     htag: int | None = None
+    ht_ft_code: str | None = None
     hs: float | None = None
     as_: float | None = None
     hst: float | None = None
@@ -80,7 +99,19 @@ class HistoricalCsvMatch:
     market_1x2: tuple[float, float, float] | None = None
     market_1x2_source: str | None = None
     market_over25: float | None = None
+    market_under25: float | None = None
     market_over25_source: str | None = None
+
+    @property
+    def ht_home_goals(self) -> int | None:
+        return self.hthg
+
+    @property
+    def ht_away_goals(self) -> int | None:
+        return self.htag
+
+
+HistoricalMatchRow = HistoricalCsvMatch
 
 
 @dataclass(slots=True)
@@ -94,6 +125,9 @@ class WalkForwardResult:
     market_over25_matches: int
     seasons: list[str]
     leagues: list[str]
+    ht_ft_evaluated_matches: int = 0
+    time_decay_xi: float = DEFAULT_TIME_DECAY_XI
+    market_blend_alpha: float = DEFAULT_MARKET_BLEND_ALPHA
     records_by_model: dict[str, list[MatchEvaluationRecord]] = field(default_factory=dict)
     overall_summaries: dict[str, ModelSummaryMetrics] = field(default_factory=dict)
     market_subset_summaries: dict[str, ModelSummaryMetrics] = field(default_factory=dict)
@@ -183,8 +217,17 @@ def parse_historical_csv(
         if not home or not away or fthg is None or ftag is None or kickoff is None:
             continue
 
+        hthg = _opt_int(row, "HTHG")
+        htag = _opt_int(row, "HTAG")
+        ht_ft = (
+            actual_ht_ft_code(hthg, htag, fthg, ftag)
+            if hthg is not None and htag is not None and hthg >= 0 and htag >= 0
+            else None
+        )
         m_1x2, m_1x2_src = extract_market_1x2_probs(row)
-        m_o25, m_o25_src = extract_market_over25_prob(row)
+        m_ou_pair, m_o25_src = extract_market_over_under25_probs(row)
+        m_o25 = m_ou_pair[0] if m_ou_pair is not None else None
+        m_u25 = m_ou_pair[1] if m_ou_pair is not None else None
 
         match_item = HistoricalCsvMatch(
             league_code=div,
@@ -196,8 +239,9 @@ def parse_historical_csv(
             away_team=away,
             fthg=fthg,
             ftag=ftag,
-            hthg=_opt_int(row, "HTHG"),
-            htag=_opt_int(row, "HTAG"),
+            hthg=hthg,
+            htag=htag,
+            ht_ft_code=ht_ft,
             hs=_opt_float(row, "HS"),
             as_=_opt_float(row, "AS"),
             hst=_opt_float(row, "HST"),
@@ -205,6 +249,7 @@ def parse_historical_csv(
             market_1x2=m_1x2,
             market_1x2_source=m_1x2_src,
             market_over25=m_o25,
+            market_under25=m_u25,
             market_over25_source=m_o25_src,
         )
         indexed_rows.append((kickoff, idx, match_item))
@@ -216,6 +261,9 @@ def parse_historical_csv(
 def _build_prior_team_metrics(
     prior_rows: Sequence[HistoricalCsvMatch],
     team_id_by_name: Mapping[str, int],
+    *,
+    time_decay_xi: float = 0.0,
+    reference_date: date | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Yalnızca geçmiş maçlardan (kickoff < D) şut ve İY/MS gol payı metriklerini toplar."""
     agg: dict[int, dict[str, float]] = {}
@@ -234,19 +282,30 @@ def _build_prior_team_metrics(
             }
         return agg[tid]
 
+    ref_ts = (
+        datetime(reference_date.year, reference_date.month, reference_date.day, 0, 0, tzinfo=UTC).timestamp()
+        if reference_date is not None
+        else (max(m.kickoff.timestamp() for m in prior_rows) if prior_rows else 0.0)
+    )
+
     for m in prior_rows:
         h_id = team_id_by_name[m.home_team]
         a_id = team_id_by_name[m.away_team]
         h_s = _slot(h_id)
         a_s = _slot(a_id)
+        w = (
+            math.exp(-time_decay_xi * max(0.0, (ref_ts - m.kickoff.timestamp()) / 86400.0))
+            if time_decay_xi > 0.0
+            else 1.0
+        )
 
         if m.hst is not None and m.ast is not None:
-            h_s["sot_for"] += m.hst
-            h_s["sot_against"] += m.ast
-            h_s["sot_n"] += 1.0
-            a_s["sot_for"] += m.ast
-            a_s["sot_against"] += m.hst
-            a_s["sot_n"] += 1.0
+            h_s["sot_for"] += w * m.hst
+            h_s["sot_against"] += w * m.ast
+            h_s["sot_n"] += w
+            a_s["sot_for"] += w * m.ast
+            a_s["sot_against"] += w * m.hst
+            a_s["sot_n"] += w
 
         if m.hthg is not None and m.htag is not None:
             h_s["ht_gf"] += float(m.hthg)
@@ -315,6 +374,8 @@ def run_walk_forward(
     *,
     warmup_matches: int = 30,
     rho: float = DEFAULT_DIXON_COLES_RHO,
+    time_decay_xi: float = DEFAULT_TIME_DECAY_XI,
+    market_blend_alpha: float = DEFAULT_MARKET_BLEND_ALPHA,
     use_prior_shot_metrics: bool = True,
     sources_used: Sequence[str] = (),
 ) -> WalkForwardResult:
@@ -357,51 +418,85 @@ def run_walk_forward(
         for current_day in days_in_order:
             todays_matches = by_day[current_day]
             if len(history_csv) >= warmup_matches:
-                baseline = calculate_league_baseline(history_schema)
-                prior_metrics = (
-                    _build_prior_team_metrics(history_csv, team_id_map)
+                # 1) Baz Post-Fix (xi=0.0, alpha=0.0)
+                baseline_unw = calculate_league_baseline(
+                    history_schema, time_decay_xi=0.0, reference_date=current_day
+                )
+                prior_metrics_unw = (
+                    _build_prior_team_metrics(
+                        history_csv, team_id_map, time_decay_xi=0.0, reference_date=current_day
+                    )
                     if use_prior_shot_metrics
                     else None
                 )
-                profiles = build_team_ratings(
+                profiles_unw = build_team_ratings(
                     history_schema,
                     injuries=(),
                     team_ids=all_team_ids,
-                    team_metrics=prior_metrics,
+                    team_metrics=prior_metrics_unw,
+                    time_decay_xi=0.0,
                     reference_date=current_day,
                 )
+
+                # 2) Zaman Sönümlü M2 (xi=time_decay_xi)
+                if time_decay_xi > 0.0:
+                    baseline_dec = calculate_league_baseline(
+                        history_schema, time_decay_xi=time_decay_xi, reference_date=current_day
+                    )
+                    prior_metrics_dec = (
+                        _build_prior_team_metrics(
+                            history_csv,
+                            team_id_map,
+                            time_decay_xi=time_decay_xi,
+                            reference_date=current_day,
+                        )
+                        if use_prior_shot_metrics
+                        else None
+                    )
+                    profiles_dec = build_team_ratings(
+                        history_schema,
+                        injuries=(),
+                        team_ids=all_team_ids,
+                        team_metrics=prior_metrics_dec,
+                        time_decay_xi=time_decay_xi,
+                        reference_date=current_day,
+                    )
+                else:
+                    baseline_dec = baseline_unw
+                    profiles_dec = profiles_unw
 
                 const_dist = predict_score_distribution(
                     home_attack=1.0,
                     away_defense=1.0,
                     away_attack=1.0,
                     home_defense=1.0,
-                    avg_home_goals=baseline.avg_home_goals,
-                    avg_away_goals=baseline.avg_away_goals,
+                    avg_home_goals=baseline_unw.avg_home_goals,
+                    avg_away_goals=baseline_unw.avg_away_goals,
                     max_goals=DEFAULT_MAX_GOALS,
                     rho=rho,
                 )
+                const_ht_ft = {h.code: h.prob for h in const_dist.all_ht_ft}
 
                 for tm in todays_matches:
-                    hp = profiles[team_id_map[tm.home_team]]
-                    ap = profiles[team_id_map[tm.away_team]]
-                    depth = min(hp.played, ap.played)
+                    hp_unw = profiles_unw[team_id_map[tm.home_team]]
+                    ap_unw = profiles_unw[team_id_map[tm.away_team]]
+                    depth = min(hp_unw.played, ap_unw.played)
                     d_str = tm.match_day.isoformat()
 
                     post_res = predict_score_distribution(
-                        home_attack=hp.adjusted_home_attack,
-                        away_defense=ap.adjusted_away_defense,
-                        away_attack=ap.adjusted_away_attack,
-                        home_defense=hp.adjusted_home_defense,
-                        avg_home_goals=baseline.avg_home_goals,
-                        avg_away_goals=baseline.avg_away_goals,
+                        home_attack=hp_unw.adjusted_home_attack,
+                        away_defense=ap_unw.adjusted_away_defense,
+                        away_attack=ap_unw.adjusted_away_attack,
+                        home_defense=hp_unw.adjusted_home_defense,
+                        avg_home_goals=baseline_unw.avg_home_goals,
+                        avg_away_goals=baseline_unw.avg_away_goals,
                         sample_matches=depth,
                         max_goals=DEFAULT_MAX_GOALS,
                         rho=rho,
-                        home_ht_attack_share=hp.first_half_attack_share,
-                        away_ht_concede_share=ap.first_half_concede_share,
-                        away_ht_attack_share=ap.first_half_attack_share,
-                        home_ht_concede_share=hp.first_half_concede_share,
+                        home_ht_attack_share=hp_unw.first_half_attack_share,
+                        away_ht_concede_share=ap_unw.first_half_concede_share,
+                        away_ht_attack_share=ap_unw.first_half_attack_share,
+                        home_ht_concede_share=hp_unw.first_half_concede_share,
                     )
                     records_by_model[MODEL_POST_FIX].append(
                         MatchEvaluationRecord(
@@ -418,16 +513,107 @@ def run_walk_forward(
                             p_over25=post_res.over_2_5_prob,
                             expected_home_goals=post_res.expected_home_goals,
                             expected_away_goals=post_res.expected_away_goals,
+                            ht_home_goals=tm.hthg,
+                            ht_away_goals=tm.htag,
+                            actual_ht_ft=tm.ht_ft_code,
+                            ht_ft_probs={h.code: h.prob for h in post_res.all_ht_ft},
+                        )
+                    )
+
+                    hp_dec = profiles_dec[team_id_map[tm.home_team]]
+                    ap_dec = profiles_dec[team_id_map[tm.away_team]]
+                    dec_res = predict_score_distribution(
+                        home_attack=hp_dec.adjusted_home_attack,
+                        away_defense=ap_dec.adjusted_away_defense,
+                        away_attack=ap_dec.adjusted_away_attack,
+                        home_defense=hp_dec.adjusted_home_defense,
+                        avg_home_goals=baseline_dec.avg_home_goals,
+                        avg_away_goals=baseline_dec.avg_away_goals,
+                        sample_matches=depth,
+                        max_goals=DEFAULT_MAX_GOALS,
+                        rho=rho,
+                        home_ht_attack_share=hp_dec.first_half_attack_share,
+                        away_ht_concede_share=ap_dec.first_half_concede_share,
+                        away_ht_attack_share=ap_dec.first_half_attack_share,
+                        home_ht_concede_share=hp_dec.first_half_concede_share,
+                    )
+                    records_by_model[MODEL_TIME_DECAY].append(
+                        MatchEvaluationRecord(
+                            league_code=tm.league_code,
+                            season_code=tm.season_code,
+                            match_date=d_str,
+                            home_team=tm.home_team,
+                            away_team=tm.away_team,
+                            home_goals=tm.fthg,
+                            away_goals=tm.ftag,
+                            p_home=dec_res.home_win_prob,
+                            p_draw=dec_res.draw_prob,
+                            p_away=dec_res.away_win_prob,
+                            p_over25=dec_res.over_2_5_prob,
+                            expected_home_goals=dec_res.expected_home_goals,
+                            expected_away_goals=dec_res.expected_away_goals,
+                            ht_home_goals=tm.hthg,
+                            ht_away_goals=tm.htag,
+                            actual_ht_ft=tm.ht_ft_code,
+                            ht_ft_probs={h.code: h.prob for h in dec_res.all_ht_ft},
+                        )
+                    )
+
+                    mkt_dict: dict[str, float] | None = None
+                    if tm.market_1x2 is not None:
+                        mkt_dict = {
+                            "p_home": tm.market_1x2[0],
+                            "p_draw": tm.market_1x2[1],
+                            "p_away": tm.market_1x2[2],
+                        }
+                        if tm.market_over25 is not None:
+                            mkt_dict["p_over25"] = tm.market_over25
+                    blend_res = predict_score_distribution(
+                        home_attack=hp_dec.adjusted_home_attack,
+                        away_defense=ap_dec.adjusted_away_defense,
+                        away_attack=ap_dec.adjusted_away_attack,
+                        home_defense=hp_dec.adjusted_home_defense,
+                        avg_home_goals=baseline_dec.avg_home_goals,
+                        avg_away_goals=baseline_dec.avg_away_goals,
+                        sample_matches=depth,
+                        max_goals=DEFAULT_MAX_GOALS,
+                        rho=rho,
+                        home_ht_attack_share=hp_dec.first_half_attack_share,
+                        away_ht_concede_share=ap_dec.first_half_concede_share,
+                        away_ht_attack_share=ap_dec.first_half_attack_share,
+                        home_ht_concede_share=hp_dec.first_half_concede_share,
+                        market_probs=mkt_dict,
+                        market_blend_alpha=market_blend_alpha,
+                    )
+                    records_by_model[MODEL_MARKET_BLEND].append(
+                        MatchEvaluationRecord(
+                            league_code=tm.league_code,
+                            season_code=tm.season_code,
+                            match_date=d_str,
+                            home_team=tm.home_team,
+                            away_team=tm.away_team,
+                            home_goals=tm.fthg,
+                            away_goals=tm.ftag,
+                            p_home=blend_res.home_win_prob,
+                            p_draw=blend_res.draw_prob,
+                            p_away=blend_res.away_win_prob,
+                            p_over25=blend_res.over_2_5_prob,
+                            expected_home_goals=blend_res.expected_home_goals,
+                            expected_away_goals=blend_res.expected_away_goals,
+                            ht_home_goals=tm.hthg,
+                            ht_away_goals=tm.htag,
+                            actual_ht_ft=tm.ht_ft_code,
+                            ht_ft_probs={h.code: h.prob for h in blend_res.all_ht_ft},
                         )
                     )
 
                     leg_lam, leg_mu, leg_ph, leg_pd, leg_pa, leg_o25 = (
                         _legacy_pre_fix_probabilities(
-                            home_attack=hp.adjusted_home_attack,
-                            away_defense=ap.adjusted_away_defense,
-                            away_attack=ap.adjusted_away_attack,
-                            home_defense=hp.adjusted_home_defense,
-                            home_advantage=baseline.home_advantage,
+                            home_attack=hp_unw.adjusted_home_attack,
+                            away_defense=ap_unw.adjusted_away_defense,
+                            away_attack=ap_unw.adjusted_away_attack,
+                            home_defense=hp_unw.adjusted_home_defense,
+                            home_advantage=baseline_unw.home_advantage,
                             rho=rho,
                         )
                     )
@@ -464,6 +650,10 @@ def run_walk_forward(
                             p_over25=const_dist.over_2_5_prob,
                             expected_home_goals=const_dist.expected_home_goals,
                             expected_away_goals=const_dist.expected_away_goals,
+                            ht_home_goals=tm.hthg,
+                            ht_away_goals=tm.htag,
+                            actual_ht_ft=tm.ht_ft_code,
+                            ht_ft_probs=dict(const_ht_ft),
                         )
                     )
 
@@ -482,6 +672,9 @@ def run_walk_forward(
                                 p_draw=mpd,
                                 p_away=mpa,
                                 p_over25=tm.market_over25,
+                                ht_home_goals=tm.hthg,
+                                ht_away_goals=tm.htag,
+                                actual_ht_ft=tm.ht_ft_code,
                             )
                         )
 
@@ -542,6 +735,9 @@ def run_walk_forward(
     }
 
     eval_count = len(records_by_model[MODEL_POST_FIX])
+    ht_ft_count = sum(
+        1 for r in records_by_model[MODEL_POST_FIX] if r.actual_ht_ft is not None
+    )
     m_1x2_count = len(records_by_model[MODEL_MARKET])
     m_o25_count = sum(1 for r in records_by_model[MODEL_MARKET] if r.p_over25 is not None)
 
@@ -551,6 +747,9 @@ def run_walk_forward(
         evaluated_matches=eval_count,
         market_1x2_matches=m_1x2_count,
         market_over25_matches=m_o25_count,
+        ht_ft_evaluated_matches=ht_ft_count,
+        time_decay_xi=time_decay_xi,
+        market_blend_alpha=market_blend_alpha,
         seasons=seasons_seen,
         leagues=leagues_seen,
         records_by_model=records_by_model,

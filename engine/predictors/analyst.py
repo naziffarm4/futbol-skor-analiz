@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from engine.models.schemas import HT_FT_LABELS_TR, ImpactLevel, Injury, PlayerPosition
 from engine.predictors.poisson import PoissonPredictionResult
@@ -320,6 +323,68 @@ def _build_team_form_paragraph(team_name: str, profile: TeamRatingProfile, *, is
     return f"{lead} {venue_record}. {cs_clause}{extra_metrics_sentence}"
 
 
+def _pure_matrix_1x2(matrix: list[list[float]]) -> tuple[float, float, float]:
+    ph = pd = pa = 0.0
+    for x, row in enumerate(matrix):
+        for y, prob in enumerate(row):
+            if x > y:
+                ph += prob
+            elif x == y:
+                pd += prob
+            else:
+                pa += prob
+    tot = ph + pd + pa
+    if tot <= 0.0:
+        return (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+    return (ph / tot, pd / tot, pa / tot)
+
+
+def _extract_market_triplet(
+    market_probs: Mapping[str, Any] | None,
+) -> tuple[float, float, float] | None:
+    if not market_probs:
+        return None
+    vals: list[float] = []
+    for keys in (
+        ("p_home", "home_prob", "prob_home"),
+        ("p_draw", "draw_prob", "prob_draw"),
+        ("p_away", "away_prob", "prob_away"),
+    ):
+        found: float | None = None
+        for k in keys:
+            raw = market_probs.get(k) if isinstance(market_probs, Mapping) else getattr(market_probs, k, None)
+            if raw is None or isinstance(raw, bool):
+                continue
+            try:
+                fval = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fval) and fval > 0.0:
+                found = fval
+                break
+        if found is None:
+            return None
+        vals.append(found)
+    s = vals[0] + vals[1] + vals[2]
+    if s <= 0.0:
+        return None
+    return (vals[0] / s, vals[1] / s, vals[2] / s)
+
+
+def _favorite_label_tr(
+    ph: float,
+    pd: float,
+    pa: float,
+    home_name: str,
+    away_name: str,
+) -> str:
+    if ph >= pd and ph >= pa:
+        return f"{home_name} galibiyeti"
+    if pa >= ph and pa >= pd:
+        return f"{away_name} galibiyeti"
+    return "beraberlik"
+
+
 def _build_score_justification_paragraph(
     *,
     home_name: str,
@@ -328,6 +393,7 @@ def _build_score_justification_paragraph(
     away_profile: TeamRatingProfile,
     poisson_result: PoissonPredictionResult,
     round_number: int | None,
+    market_probs: Mapping[str, float] | None = None,
 ) -> str:
     """1. Paragraf: Öne çıkan tahmini skoru ilk cümlede belirterek somut saha verileriyle gerekçelendirir."""
     pred_h = poisson_result.predicted_home_score
@@ -441,8 +507,55 @@ def _build_score_justification_paragraph(
             f"beklentisini sahadaki pozisyon hacmiyle destekliyor."
         )
 
+    ht_ft_seq = poisson_result.all_ht_ft or poisson_result.top_ht_ft
+    over25_pct = poisson_result.over_2_5_prob * 100.0
+    btts_pct = poisson_result.btts_yes_prob * 100.0
+    if len(ht_ft_seq) >= 2:
+        h1, h2 = ht_ft_seq[0], ht_ft_seq[1]
+        outlook_sentence = (
+            f"İY/MS görünümünde {h1.code} ({h1.label}, %{h1.prob * 100:.1f}) başı çekerken "
+            f"{h2.code} ({h2.label}, %{h2.prob * 100:.1f}) en yakın takipçi konumunda bulunuyor; "
+            f"ayrıca 2.5 Üst ihtimali %{over25_pct:.1f} ve KG Var beklentisi %{btts_pct:.1f} düzeyinde seyrediyor."
+        )
+    else:
+        outlook_sentence = (
+            f"Karşılaşmada 2.5 Üst ihtimali %{over25_pct:.1f} ve KG Var beklentisi %{btts_pct:.1f} "
+            f"düzeyinde öne çıkıyor."
+        )
+
+    mkt_triplet = _extract_market_triplet(market_probs)
+    market_sentence = ""
+    if mkt_triplet is not None or poisson_result.market_blended:
+        pure_h, pure_d, pure_a = _pure_matrix_1x2(poisson_result.matrix)
+        mh, md, ma = mkt_triplet or (
+            poisson_result.home_win_prob,
+            poisson_result.draw_prob,
+            poisson_result.away_win_prob,
+        )
+        pure_fav = _favorite_label_tr(pure_h, pure_d, pure_a, home_name, away_name)
+        mkt_fav = _favorite_label_tr(mh, md, ma, home_name, away_name)
+        if pure_fav == mkt_fav:
+            market_sentence = (
+                f"Saha içi istatistik modeli ile marjı arındırılmış piyasa beklentisi de "
+                f"{pure_fav} yönünde uzlaşarak bu tahmini teyit ediyor."
+            )
+        else:
+            market_sentence = (
+                f"Saha içi istatistik modeli {pure_fav} sinyali üretirken marjı arındırılmış "
+                f"piyasa beklentisinin {mkt_fav} tarafına yönelmesi eşleşmedeki taktik dengeye dikkat çekiyor."
+            )
+
     return " ".join(
-        part for part in (first_sentence, stats_sentence, pressure_sentence, alt_sentence) if part
+        part
+        for part in (
+            first_sentence,
+            stats_sentence,
+            pressure_sentence,
+            alt_sentence,
+            outlook_sentence,
+            market_sentence,
+        )
+        if part
     )
 
 
@@ -592,6 +705,7 @@ def _build_ht_ft_reasoning_text(
     home_profile: TeamRatingProfile,
     away_profile: TeamRatingProfile,
     poisson_result: PoissonPredictionResult,
+    market_probs: Mapping[str, float] | None = None,
 ) -> str:
     """5 kaynaktaki tüm metrikleri sentezleyerek 'Neden bu İY ve MS çıktı?' sorusunu 2 paragrafta açıklar."""
     ht_h = poisson_result.predicted_ht_home_score
@@ -826,7 +940,41 @@ def _build_ht_ft_reasoning_text(
     else:
         top3_clause = ""
 
-    p2 = " ".join(part for part in (tempo_clause, injury_cmp_clause, top3_clause) if part)
+    over25_pct = poisson_result.over_2_5_prob * 100.0
+    btts_pct = poisson_result.btts_yes_prob * 100.0
+    ou_btts_clause = (
+        f"Gol piyasası projeksiyonlarında 2.5 Üst ihtimali %{over25_pct:.1f} ve KG Var olasılığı "
+        f"%{btts_pct:.1f} olarak hesaplanıyor."
+    )
+
+    mkt_triplet = _extract_market_triplet(market_probs)
+    mkt_cmp_clause = ""
+    if mkt_triplet is not None or poisson_result.market_blended:
+        pure_h, pure_d, pure_a = _pure_matrix_1x2(poisson_result.matrix)
+        mh, md, ma = mkt_triplet or (
+            poisson_result.home_win_prob,
+            poisson_result.draw_prob,
+            poisson_result.away_win_prob,
+        )
+        pure_fav = _favorite_label_tr(pure_h, pure_d, pure_a, home_name, away_name)
+        mkt_fav = _favorite_label_tr(mh, md, ma, home_name, away_name)
+        if pure_fav == mkt_fav:
+            mkt_cmp_clause = (
+                f"Poisson modeli (Ev %{pure_h * 100:.1f} - Dep %{pure_a * 100:.1f}) ile marjı arındırılmış "
+                f"piyasa beklentisi (Ev %{mh * 100:.1f} - Dep %{ma * 100:.1f}) {pure_fav} ekseninde örtüşüyor."
+            )
+        else:
+            mkt_cmp_clause = (
+                f"Poisson modeli (Ev %{pure_h * 100:.1f} - Dep %{pure_a * 100:.1f}) {pure_fav} yönünü işaret "
+                f"ederken marjı arındırılmış piyasa beklentisi (Ev %{mh * 100:.1f} - Dep %{ma * 100:.1f}) "
+                f"{mkt_fav} tarafında ayrışıyor."
+            )
+
+    p2 = " ".join(
+        part
+        for part in (tempo_clause, injury_cmp_clause, top3_clause, ou_btts_clause, mkt_cmp_clause)
+        if part
+    )
     return f"{p1}\n\n{p2}"
 
 
@@ -838,6 +986,7 @@ def generate_match_analysis_texts(
     away_profile: TeamRatingProfile,
     poisson_result: PoissonPredictionResult,
     round_number: int | None = None,
+    market_probs: Mapping[str, float] | None = None,
 ) -> MatchAnalysisTexts:
     """Takım profilleri ve skor tahmininden doğal, 2'şer paragraflı Türkçe maç ve takım analizleri üretir."""
     overview_p1 = _build_score_justification_paragraph(
@@ -847,6 +996,7 @@ def generate_match_analysis_texts(
         away_profile=away_profile,
         poisson_result=poisson_result,
         round_number=round_number,
+        market_probs=market_probs,
     )
     overview_p2 = _build_scenario_paragraph(
         home_name=home_name,
@@ -871,6 +1021,7 @@ def generate_match_analysis_texts(
         home_profile=home_profile,
         away_profile=away_profile,
         poisson_result=poisson_result,
+        market_probs=market_probs,
     )
 
     return MatchAnalysisTexts(

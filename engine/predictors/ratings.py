@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any, cast
 
 from engine.models.schemas import ImpactLevel, Injury, Match, MatchStatus, PlayerPosition
@@ -19,6 +20,7 @@ MAX_FIRST_HALF_SHARE = 0.65
 GOAL_RATIO_WEIGHT = 0.65
 PRESSURE_RATIO_WEIGHT = 0.35
 PRIOR_MATCH_WEIGHT = 3.0
+DEFAULT_TIME_DECAY_XI: float = 0.0015
 VERIFIED_INJURY_WEIGHT = 1.0
 UNCERTAIN_SINGLE_SOURCE_INJURY_WEIGHT = 0.75
 
@@ -164,7 +166,20 @@ class TeamRatingProfile:
     sources_matched: list[str] = field(default_factory=list)
 
 
-def calculate_league_baseline(matches: Iterable[Match]) -> LeagueBaseline:
+def _to_utc_timestamp(val: datetime | date) -> float:
+    """Naive veya timezone-aware datetime/date değerini güvenli biçimde UTC epoch saniyesine çevirir."""
+    if isinstance(val, datetime):
+        dt = val if val.tzinfo is not None else val.replace(tzinfo=UTC)
+        return dt.timestamp()
+    return datetime(val.year, val.month, val.day, 0, 0, tzinfo=UTC).timestamp()
+
+
+def calculate_league_baseline(
+    matches: Iterable[Match],
+    *,
+    time_decay_xi: float = DEFAULT_TIME_DECAY_XI,
+    reference_date: datetime | date | None = None,
+) -> LeagueBaseline:
     """Oynanmış maçlardan lig ev/deplasman gol ortalamalarını ve iç saha avantajını çıkarır."""
     finished = [
         m
@@ -183,8 +198,32 @@ def calculate_league_baseline(matches: Iterable[Match]) -> LeagueBaseline:
         )
 
     n = len(finished)
-    raw_home = sum(int(m.home_score or 0) for m in finished) / n
-    raw_away = sum(int(m.away_score or 0) for m in finished) / n
+    if time_decay_xi > 0.0:
+        ref_ts = (
+            _to_utc_timestamp(reference_date)
+            if reference_date is not None
+            else max(_to_utc_timestamp(m.match_date) for m in finished)
+        )
+        weights = [
+            math.exp(
+                -time_decay_xi * max(0.0, (ref_ts - _to_utc_timestamp(m.match_date)) / 86400.0)
+            )
+            for m in finished
+        ]
+        w_sum = sum(weights)
+        raw_home = (
+            sum(w * int(m.home_score or 0) for w, m in zip(weights, finished, strict=True)) / w_sum
+            if w_sum > 0.0
+            else sum(int(m.home_score or 0) for m in finished) / n
+        )
+        raw_away = (
+            sum(w * int(m.away_score or 0) for w, m in zip(weights, finished, strict=True)) / w_sum
+            if w_sum > 0.0
+            else sum(int(m.away_score or 0) for m in finished) / n
+        )
+    else:
+        raw_home = sum(int(m.home_score or 0) for m in finished) / n
+        raw_away = sum(int(m.away_score or 0) for m in finished) / n
 
     # Küçük örneklemlerde aşırı uçları yumuşatmak için varsayılan lig ortalamasıyla sönümle
     blend = min(1.0, n / 12.0)
@@ -452,10 +491,15 @@ def build_team_ratings(
     team_ids: Iterable[int] | None = None,
     prior_weight: float = PRIOR_MATCH_WEIGHT,
     team_metrics: Mapping[int, Any] | None = None,
-    reference_date: date | None = None,
+    time_decay_xi: float = DEFAULT_TIME_DECAY_XI,
+    reference_date: datetime | date | None = None,
 ) -> dict[int, TeamRatingProfile]:
     """Oynanmış maçlardan ve çoklu kaynak metriklerinden takım reyting profillerini üretir."""
-    baseline = calculate_league_baseline(matches)
+    baseline = calculate_league_baseline(
+        matches,
+        time_decay_xi=time_decay_xi,
+        reference_date=reference_date,
+    )
     finished = sorted(
         (
             m
@@ -464,7 +508,7 @@ def build_team_ratings(
             and m.home_score is not None
             and m.away_score is not None
         ),
-        key=lambda m: (m.match_date, m.round),
+        key=lambda m: (_to_utc_timestamp(m.match_date), m.round),
     )
 
     discovered_ids: set[int] = set(team_ids or ())
@@ -484,9 +528,32 @@ def build_team_ratings(
     }
     form_history: dict[int, list[str]] = {tid: [] for tid in discovered_ids}
 
+    w_played: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_home_played: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_away_played: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_gf: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_ga: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_hgf: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_hga: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_agf: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+    w_aga: dict[int, float] = {tid: 0.0 for tid in discovered_ids}
+
+    ref_ts = (
+        _to_utc_timestamp(reference_date)
+        if reference_date is not None
+        else (max(_to_utc_timestamp(m.match_date) for m in finished) if finished else 0.0)
+    )
+
     for m in finished:
         hs = int(m.home_score or 0)
         as_ = int(m.away_score or 0)
+        w = (
+            math.exp(
+                -time_decay_xi * max(0.0, (ref_ts - _to_utc_timestamp(m.match_date)) / 86400.0)
+            )
+            if time_decay_xi > 0.0
+            else 1.0
+        )
         hp = profiles[m.home_team_id]
         ap = profiles[m.away_team_id]
 
@@ -499,6 +566,13 @@ def build_team_ratings(
         if as_ == 0:
             hp.clean_sheets += 1
 
+        w_played[m.home_team_id] += w
+        w_home_played[m.home_team_id] += w
+        w_gf[m.home_team_id] += w * hs
+        w_ga[m.home_team_id] += w * as_
+        w_hgf[m.home_team_id] += w * hs
+        w_hga[m.home_team_id] += w * as_
+
         ap.played += 1
         ap.away_played += 1
         ap.goals_for += as_
@@ -508,6 +582,13 @@ def build_team_ratings(
         if hs == 0:
             ap.clean_sheets += 1
             ap.away_clean_sheets += 1
+
+        w_played[m.away_team_id] += w
+        w_away_played[m.away_team_id] += w
+        w_gf[m.away_team_id] += w * as_
+        w_ga[m.away_team_id] += w * hs
+        w_agf[m.away_team_id] += w * as_
+        w_aga[m.away_team_id] += w * hs
 
         if hs > as_:
             hp.home_wins += 1
@@ -551,28 +632,60 @@ def build_team_ratings(
         sum(xg_samples) / len(xg_samples) if len(xg_samples) >= 2 else max(0.60, avg_team_goals)
     )
     avg_sot = sum(sot_samples) / len(sot_samples) if len(sot_samples) >= 2 else DEFAULT_AVG_SOT
+    inj_ref_date = reference_date.date() if isinstance(reference_date, datetime) else reference_date
 
     for tid, prof in profiles.items():
         prof.recent_form = form_history[tid][-5:]
 
-        home_att = (prof.home_goals_for + prior_weight * baseline.avg_home_goals) / (
+        if time_decay_xi > 0.0:
+            eff_hgf = (
+                prof.home_played * (w_hgf[tid] / w_home_played[tid])
+                if w_home_played[tid] > 0.0
+                else 0.0
+            )
+            eff_hga = (
+                prof.home_played * (w_hga[tid] / w_home_played[tid])
+                if w_home_played[tid] > 0.0
+                else 0.0
+            )
+            eff_agf = (
+                prof.away_played * (w_agf[tid] / w_away_played[tid])
+                if w_away_played[tid] > 0.0
+                else 0.0
+            )
+            eff_aga = (
+                prof.away_played * (w_aga[tid] / w_away_played[tid])
+                if w_away_played[tid] > 0.0
+                else 0.0
+            )
+            eff_gf = prof.played * (w_gf[tid] / w_played[tid]) if w_played[tid] > 0.0 else 0.0
+            eff_ga = prof.played * (w_ga[tid] / w_played[tid]) if w_played[tid] > 0.0 else 0.0
+        else:
+            eff_hgf = float(prof.home_goals_for)
+            eff_hga = float(prof.home_goals_against)
+            eff_agf = float(prof.away_goals_for)
+            eff_aga = float(prof.away_goals_against)
+            eff_gf = float(prof.goals_for)
+            eff_ga = float(prof.goals_against)
+
+        home_att = (eff_hgf + prior_weight * baseline.avg_home_goals) / (
             (prof.home_played + prior_weight) * baseline.avg_home_goals
         )
-        away_att = (prof.away_goals_for + prior_weight * baseline.avg_away_goals) / (
+        away_att = (eff_agf + prior_weight * baseline.avg_away_goals) / (
             (prof.away_played + prior_weight) * baseline.avg_away_goals
         )
-        overall_att = (prof.goals_for + prior_weight * avg_team_goals) / (
+        overall_att = (eff_gf + prior_weight * avg_team_goals) / (
             (prof.played + prior_weight) * avg_team_goals
         )
 
         # Ev sahibi kalesinde deplasman ortalamasına göre; deplasmanda ev ortalamasına göre gol yer
-        home_def = (prof.home_goals_against + prior_weight * baseline.avg_away_goals) / (
+        home_def = (eff_hga + prior_weight * baseline.avg_away_goals) / (
             (prof.home_played + prior_weight) * baseline.avg_away_goals
         )
-        away_def = (prof.away_goals_against + prior_weight * baseline.avg_home_goals) / (
+        away_def = (eff_aga + prior_weight * baseline.avg_home_goals) / (
             (prof.away_played + prior_weight) * baseline.avg_home_goals
         )
-        overall_def = (prof.goals_against + prior_weight * avg_team_goals) / (
+        overall_def = (eff_ga + prior_weight * avg_team_goals) / (
             (prof.played + prior_weight) * avg_team_goals
         )
 
@@ -627,7 +740,7 @@ def build_team_ratings(
         apply_injuries_to_profile(
             prof,
             injuries_by_team.get(tid, ()),
-            reference_date=reference_date,
+            reference_date=inj_ref_date,
         )
 
     return profiles

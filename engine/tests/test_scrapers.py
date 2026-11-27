@@ -316,9 +316,8 @@ class BaseScraperTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
         self.assertEqual(calls, 1)
 
-    def test_waf_202_switches_to_browser_and_preserves_404(self) -> None:
+    def test_waf_202_raises_http_error_without_browser_bypass(self) -> None:
         http_calls = 0
-        browser_calls: list[str] = []
 
         def handler(_: httpx.Request) -> httpx.Response:
             nonlocal http_calls
@@ -329,12 +328,6 @@ class BaseScraperTests(unittest.TestCase):
                 text="<script>AwsWafIntegration</script>",
             )
 
-        def fake_browser(full_url: str) -> tuple[int, str]:
-            browser_calls.append(full_url)
-            if full_url.endswith("/missing"):
-                return 404, "<html>Not Found</html>"
-            return 200, "<html><body><div class='box'>waf-ok</div></body></html>"
-
         client = httpx.Client(
             base_url="https://mock.tm.local",
             transport=httpx.MockTransport(handler),
@@ -343,24 +336,15 @@ class BaseScraperTests(unittest.TestCase):
             base_url="https://mock.tm.local",
             min_delay=0.0,
             max_delay=0.0,
-            max_retries=1,
+            max_retries=2,
             client=client,
-            browser_fetcher=fake_browser,
         ) as scraper:
-            soup = scraper.fetch_soup("/fixtures")
-            box = soup.select_one(".box")
-            assert box is not None
-            self.assertEqual(box.get_text(), "waf-ok")
             with self.assertRaises(ScraperHTTPError) as ctx:
-                scraper.fetch_text("/missing")
-            self.assertEqual(ctx.exception.status_code, 404)
+                scraper.fetch_soup("/fixtures")
+            self.assertEqual(ctx.exception.status_code, 202)
 
         client.close()
         self.assertEqual(http_calls, 1)
-        self.assertEqual(
-            browser_calls,
-            ["https://mock.tm.local/fixtures", "https://mock.tm.local/missing"],
-        )
 
 
 class InjuriesScraperTests(unittest.TestCase):

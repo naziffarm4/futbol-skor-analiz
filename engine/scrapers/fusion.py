@@ -11,9 +11,11 @@ from typing import Any
 
 from engine.models.schemas import Injury, Match, MatchStatus, Team
 from engine.scrapers.base import normalize_team_name
+from engine.scrapers.sources.api_football import ApiFootballLeagueData
 from engine.scrapers.sources.espn import ESPNLeagueData
 from engine.scrapers.sources.football_data import FootballDataLeagueData
 from engine.scrapers.sources.secondary_check import SecondaryCheckData, SecondaryInjuryRecord
+from engine.scrapers.sources.the_odds_api import TheOddsLeagueData
 from engine.scrapers.sources.understat import UnderstatLeagueData, derive_xg_from_shots
 
 _CHAR_TRANSLATION = str.maketrans(
@@ -144,6 +146,9 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
         "buyuksehir belediye erzurumspor",
     ),
     "ankaragucu": ("ankaragucu", "mke ankaragucu"),
+    "amedspor": ("amed", "amed sk", "amedspor", "amed sportif", "amed sportif faaliyetler"),
+    "pendikspor": ("pendikspor", "pendik"),
+    "eyupspor_alt": ("ikas eyup",),
     # Premier League
     "manchester city": ("man city", "manchester city", "mancity"),
     "manchester united": ("man united", "man utd", "manchester utd", "manchester united"),
@@ -415,8 +420,11 @@ def fuse_team_metrics(
     football_data: FootballDataLeagueData | None = None,
     understat_data: UnderstatLeagueData | None = None,
     secondary_data: SecondaryCheckData | None = None,
+    api_football_data: ApiFootballLeagueData | None = None,
+    odds_data: TheOddsLeagueData | None = None,
+    primary_source_name: str = "Transfermarkt",
 ) -> dict[int, TeamMultiSourceMetrics]:
-    """5 kaynaktan gelen takım metriklerini kanonik takım kimlikleri altında birleştirir."""
+    """Çoklu kaynaktan gelen takım metriklerini kanonik takım kimlikleri altında birleştirir."""
     alias = resolver or TeamAliasResolver(teams)
     alias.register_teams(teams)
 
@@ -427,10 +435,11 @@ def fuse_team_metrics(
         if tm.id is None:
             continue
         ck = alias.resolve_key(tm.name)
+        initial_sources = [primary_source_name] if primary_source_name else []
         m = TeamMultiSourceMetrics(
             team_name=tm.name,
             canonical_key=ck,
-            sources_matched=["Transfermarkt"],
+            sources_matched=initial_sources,
         )
         by_id[tm.id] = m
         if ck:
@@ -554,7 +563,118 @@ def fuse_team_metrics(
             if tm_metric is not None:
                 _add_source(tm_metric, inj_row.source_name or sec_label)
 
+    # 5. API-Football resmi fikstür / İY-MS yedek payları ve sakatlık eşleşmeleri
+    if api_football_data is not None:
+        ht_acc: dict[int, list[int]] = {}
+        for sm in api_football_data.matches:
+            hm = _lookup_metric(sm.home_team_name)
+            am = _lookup_metric(sm.away_team_name)
+            if hm is not None:
+                _add_source(hm, "API-Football")
+            if am is not None:
+                _add_source(am, "API-Football")
+            if sm.status == MatchStatus.FINISHED and sm.home_score is not None and sm.away_score is not None:
+                ht_pair = api_football_data.ht_scores.get((sm.home_team_name, sm.away_team_name))
+                if ht_pair is not None:
+                    hid = alias.resolve_team_id(sm.home_team_name)
+                    aid = alias.resolve_team_id(sm.away_team_name)
+                    if hid is not None:
+                        acc_h = ht_acc.setdefault(hid, [0, 0, 0, 0])
+                        acc_h[0] += ht_pair[0]
+                        acc_h[1] += ht_pair[1]
+                        acc_h[2] += sm.home_score
+                        acc_h[3] += sm.away_score
+                    if aid is not None:
+                        acc_a = ht_acc.setdefault(aid, [0, 0, 0, 0])
+                        acc_a[0] += ht_pair[1]
+                        acc_a[1] += ht_pair[0]
+                        acc_a[2] += sm.away_score
+                        acc_a[3] += sm.home_score
+
+        for tid, totals in ht_acc.items():
+            tm_metric = by_id.get(tid)
+            if tm_metric is not None and tm_metric.first_half_attack_share is None:
+                tm_metric.ht_goals_for = totals[0]
+                tm_metric.ht_goals_against = totals[1]
+                tm_metric.ft_goals_for_fd = totals[2]
+                tm_metric.ft_goals_against_fd = totals[3]
+                tm_metric.first_half_attack_share = compute_damped_first_half_share(totals[0], totals[2])
+                tm_metric.first_half_concede_share = compute_damped_first_half_share(totals[1], totals[3])
+
+        for af_inj in api_football_data.injuries:
+            tm_metric = _lookup_metric(af_inj.team_name)
+            if tm_metric is not None:
+                _add_source(tm_metric, "API-Football")
+
+    # 6. The Odds API konsensüs piyasa olasılıkları
+    if odds_data is not None:
+        odds_acc: dict[int, list[float]] = {}
+        for om in odds_data.matches:
+            hid = alias.resolve_team_id(om.home_team)
+            aid = alias.resolve_team_id(om.away_team)
+            if hid is not None and hid in by_id:
+                _add_source(by_id[hid], "TheOddsAPI")
+                odds_acc.setdefault(hid, []).append(om.p_home)
+            if aid is not None and aid in by_id:
+                _add_source(by_id[aid], "TheOddsAPI")
+                odds_acc.setdefault(aid, []).append(om.p_away)
+        for tid, probs in odds_acc.items():
+            if probs:
+                by_id[tid].market_win_prob_avg = round(sum(probs) / len(probs), 4)
+
     return by_id
+
+
+def build_market_odds_map(
+    teams: list[Team],
+    *,
+    resolver: TeamAliasResolver | None = None,
+    odds_data: TheOddsLeagueData | None = None,
+    football_data: FootballDataLeagueData | None = None,
+) -> dict[tuple[int, int], dict[str, float]]:
+    """(home_team_id, away_team_id) anahtarlı marjsız piyasa olasılık haritası üretir."""
+    alias = resolver or TeamAliasResolver(teams)
+    alias.register_teams(teams)
+    market_map: dict[tuple[int, int], dict[str, float]] = {}
+
+    if football_data is not None:
+        for fm in football_data.matches:
+            if fm.home_win_prob is None or fm.away_win_prob is None:
+                continue
+            hid = alias.resolve_team_id(fm.home_team)
+            aid = alias.resolve_team_id(fm.away_team)
+            if hid is None or aid is None or hid == aid:
+                continue
+            p_h = round(float(fm.home_win_prob), 6)
+            p_a = round(float(fm.away_win_prob), 6)
+            p_d = round(max(0.0, 1.0 - p_h - p_a), 6)
+            market_map[(hid, aid)] = {
+                "p_home": p_h,
+                "p_draw": p_d,
+                "p_away": p_a,
+                "bookmakers_count": 1.0,
+            }
+
+    if odds_data is not None:
+        for om in odds_data.matches:
+            hid = alias.resolve_team_id(om.home_team)
+            aid = alias.resolve_team_id(om.away_team)
+            if hid is None or aid is None or hid == aid:
+                continue
+            entry: dict[str, float] = {
+                "p_home": om.p_home,
+                "p_draw": om.p_draw,
+                "p_away": om.p_away,
+                "bookmakers_count": float(om.bookmakers_count),
+            }
+            if om.p_over25 is not None and om.p_under25 is not None:
+                entry["p_over25"] = om.p_over25
+                entry["p_under25"] = om.p_under25
+            if om.overround_1x2 is not None:
+                entry["overround_1x2"] = om.overround_1x2
+            market_map[(hid, aid)] = entry
+
+    return market_map
 
 
 def _normalize_player_name(name: str) -> str:
@@ -598,8 +718,9 @@ def cross_validate_injuries(
     secondary_injuries: list[SecondaryInjuryRecord],
     *,
     resolver: TeamAliasResolver | None = None,
+    primary_source_name: str = "Transfermarkt",
 ) -> tuple[list[Injury], int]:
-    """Transfermarkt sakatlıklarını 2. kaynak sakatlık listesiyle çapraz doğrular."""
+    """Birincil sakatlıkları ikincil kaynak sakatlık listesiyle çapraz doğrular."""
     if not primary_injuries or not secondary_injuries:
         return primary_injuries, 0
 
@@ -622,7 +743,7 @@ def cross_validate_injuries(
     for inj in primary_injuries:
         tk = team_key_by_id.get(inj.team_id, "")
         candidates = sec_by_team.get(tk, [])
-        matched_sources: list[str] = ["Transfermarkt"]
+        matched_sources: list[str] = [primary_source_name] if primary_source_name else []
         for cand in candidates:
             if _players_match(inj.player_name, cand.player_name):
                 sec_src = cand.source_name or "SportsGambler"

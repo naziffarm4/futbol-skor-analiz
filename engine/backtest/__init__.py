@@ -1,10 +1,12 @@
 """Sızıntısız (zero-leakage) walk-forward backtest ve olasılıksal kalibrasyon paketi."""
 
-from engine.backtest.cli import main, render_markdown_report
+from engine.backtest.cli import main, render_markdown_report, render_v2_markdown_report
 from engine.backtest.metrics import (
     CalibrationBucket,
     MatchEvaluationRecord,
+    MetricsSummary,
     ModelSummaryMetrics,
+    actual_ht_ft_code,
     binary_brier_score,
     binary_log_loss,
     compute_calibration_buckets,
@@ -12,6 +14,10 @@ from engine.backtest.metrics import (
     devig_two_way_odds,
     extract_market_1x2_probs,
     extract_market_over25_prob,
+    extract_market_over_under25_probs,
+    ht_ft_log_loss,
+    ht_ft_multiclass_brier,
+    ht_ft_top_k_hit,
     multiclass_brier_score,
     multiclass_log_loss,
     outcome_one_hot,
@@ -19,11 +25,15 @@ from engine.backtest.metrics import (
     summarize_records,
 )
 from engine.backtest.runner import (
+    ABLATION_MODEL_ORDER,
     MODEL_BASELINE,
     MODEL_MARKET,
+    MODEL_MARKET_BLEND,
     MODEL_POST_FIX,
     MODEL_PRE_FIX,
+    MODEL_TIME_DECAY,
     HistoricalCsvMatch,
+    HistoricalMatchRow,
     WalkForwardResult,
     fetch_football_data_csv_text,
     parse_historical_csv,
@@ -31,15 +41,21 @@ from engine.backtest.runner import (
 )
 
 __all__ = [
+    "ABLATION_MODEL_ORDER",
     "MODEL_BASELINE",
     "MODEL_MARKET",
+    "MODEL_MARKET_BLEND",
     "MODEL_POST_FIX",
     "MODEL_PRE_FIX",
+    "MODEL_TIME_DECAY",
     "CalibrationBucket",
     "HistoricalCsvMatch",
+    "HistoricalMatchRow",
     "MatchEvaluationRecord",
+    "MetricsSummary",
     "ModelSummaryMetrics",
     "WalkForwardResult",
+    "actual_ht_ft_code",
     "binary_brier_score",
     "binary_log_loss",
     "compute_calibration_buckets",
@@ -47,7 +63,11 @@ __all__ = [
     "devig_two_way_odds",
     "extract_market_1x2_probs",
     "extract_market_over25_prob",
+    "extract_market_over_under25_probs",
     "fetch_football_data_csv_text",
+    "ht_ft_log_loss",
+    "ht_ft_multiclass_brier",
+    "ht_ft_top_k_hit",
     "main",
     "multiclass_brier_score",
     "multiclass_log_loss",
@@ -55,6 +75,7 @@ __all__ = [
     "parse_historical_csv",
     "ranked_probability_score",
     "render_markdown_report",
+    "render_v2_markdown_report",
     "run_walk_forward",
     "summarize_records",
 ]

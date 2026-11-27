@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
@@ -884,6 +885,400 @@ void main() {
           find.text(AppConstants.statisticalDisclaimer),
           findsOneWidget,
         );
+      },
+    );
+
+    test(
+      'Test 12: GÖREV-13 PredictionModel 9 senaryolu all_ht_ft_json, 1X2/Üst-Alt/KG harmanı ve eski JSON yedekleme uyumluluğu',
+      () {
+        final fullPred = PredictionModel.fromJson(const <String, dynamic>{
+          'id': 1,
+          'match_id': 1,
+          'predicted_home_score': 2,
+          'predicted_away_score': 1,
+          'predicted_ht_home_score': 1,
+          'predicted_ht_away_score': 0,
+          'ht_ft_prediction': '1/1',
+          'top_ht_ft_json': <Map<String, dynamic>>[
+            <String, dynamic>{'code': '1/1', 'label': 'Ev / Ev', 'prob': 0.362},
+            <String, dynamic>{
+              'code': 'X/1',
+              'label': 'Beraberlik / Ev',
+              'prob': 0.184,
+            },
+            <String, dynamic>{
+              'code': 'X/X',
+              'label': 'Beraberlik / Beraberlik',
+              'prob': 0.141,
+            },
+          ],
+          'all_ht_ft_json': <Map<String, dynamic>>[
+            <String, dynamic>{'code': '1/1', 'label': 'Ev / Ev', 'prob': 0.362},
+            <String, dynamic>{
+              'code': 'X/1',
+              'label': 'Beraberlik / Ev',
+              'prob': 0.184,
+            },
+            <String, dynamic>{
+              'code': 'X/X',
+              'label': 'Beraberlik / Beraberlik',
+              'prob': 0.141,
+            },
+            <String, dynamic>{
+              'code': '2/2',
+              'label': 'Dep / Dep',
+              'prob': 0.095,
+            },
+            <String, dynamic>{
+              'code': '1/X',
+              'label': 'Ev / Beraberlik',
+              'prob': 0.068,
+            },
+            <String, dynamic>{
+              'code': 'X/2',
+              'label': 'Beraberlik / Dep',
+              'prob': 0.062,
+            },
+            <String, dynamic>{
+              'code': '2/X',
+              'label': 'Dep / Beraberlik',
+              'prob': 0.041,
+            },
+            <String, dynamic>{
+              'code': '2/1',
+              'label': 'Dep / Ev',
+              'prob': 0.026,
+            },
+            <String, dynamic>{
+              'code': '1/2',
+              'label': 'Ev / Dep',
+              'prob': 0.021,
+            },
+          ],
+          'p_home': 0.572,
+          'p_draw': 0.250,
+          'p_away': 0.178,
+          'p_over25': 0.585,
+          'p_under25': 0.415,
+          'p_btts_yes': 0.542,
+          'p_btts_no': 0.458,
+          'market_blended': true,
+          'confidence_rate': 0.42,
+          'top_scores_json': <Map<String, dynamic>>[
+            <String, dynamic>{'score': '2-1', 'prob': 0.142},
+            <String, dynamic>{'score': '1-0', 'prob': 0.118},
+            <String, dynamic>{'score': '1-1', 'prob': 0.109},
+          ],
+        });
+
+        expect(fullPred.allHtFt, hasLength(9));
+        for (final code in PredictionModel.canonicalHtFtCodes) {
+          final opt = fullPred.htFtProbFor(code);
+          expect(opt.code, code);
+          expect(opt.prob, greaterThan(0.0));
+        }
+        expect(fullPred.bestHtFt.code, '1/1');
+        expect(fullPred.bestHtFt.percentText, '%36.2');
+        expect(fullPred.htFtOptionFor('2/1').percentText, '%2.6');
+        expect(fullPred.htFtOptionFor('1/2').percentText, '%2.1');
+        expect(fullPred.pHomeText, '%57.2');
+        expect(fullPred.pDrawText, '%25.0');
+        expect(fullPred.pAwayText, '%17.8');
+        expect(fullPred.pOver25Text, '%58.5');
+        expect(fullPred.pUnder25Text, '%41.5');
+        expect(fullPred.pBttsYesText, '%54.2');
+        expect(fullPred.pBttsNoText, '%45.8');
+        expect(fullPred.marketBlended, isTrue);
+        expect(fullPred.bestHtFtBadge, 'İY/MS 1/1 %36');
+        expect(fullPred.compactProbSummary, 'İY/MS 1/1 %36 • 1:%57 X:%25 2:%18');
+
+        // Eski önbellek JSON (all_ht_ft_json ve p_home/p_over25/p_btts_yes eksik)
+        final legacyPred = PredictionModel.fromJson(const <String, dynamic>{
+          'id': 9,
+          'match_id': 99,
+          'predicted_ht_home_score': 1,
+          'predicted_ht_away_score': 0,
+          'predicted_home_score': 2,
+          'predicted_away_score': 0,
+          'confidence_rate': 0.51,
+        });
+
+        expect(legacyPred.allHtFt, hasLength(9));
+        for (final code in PredictionModel.canonicalHtFtCodes) {
+          expect(legacyPred.htFtProbFor(code).prob, greaterThan(0.0));
+        }
+        expect(legacyPred.pHome, greaterThan(legacyPred.pAway));
+        expect(legacyPred.pHomeShort, isNot('%0'));
+        expect(legacyPred.pDrawShort, isNot('%0'));
+        expect(legacyPred.pAwayShort, isNot('%0'));
+        expect(
+          (legacyPred.pHome + legacyPred.pDraw + legacyPred.pAway),
+          closeTo(1.0, 1e-6),
+        );
+        expect(
+          (legacyPred.pOver25 + legacyPred.pUnder25),
+          closeTo(1.0, 1e-6),
+        );
+        expect(
+          (legacyPred.pBttsYes + legacyPred.pBttsNo),
+          closeTo(1.0, 1e-6),
+        );
+        expect(legacyPred.marketBlended, isFalse);
+
+        // cacheFilePath enjeksiyonu ve varsayılan systemTemp yedeklemesi kontrolü
+        final customCacheService = BulletinApiService(
+          cacheFilePath: '${Directory.systemTemp.path}/custom_bulten_test.json',
+        );
+        expect(customCacheService.isOfflineCacheEnabled, isTrue);
+      },
+    );
+
+    testWidgets(
+      'Test 13: 360x800 ekranda MatchCard 1/X/2 + İY/MS yüzdelerini ve MatchDetailScreen Olasılık Özeti + 3x3 İY/MS matrisini taşmasız çizer',
+      (WidgetTester tester) async {
+        tester.view.physicalSize = const Size(360, 800);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(() {
+          tester.view.resetPhysicalSize();
+          tester.view.resetDevicePixelRatio();
+        });
+
+        final payload = jsonDecode(realBulletinRaw) as Map<String, dynamic>;
+        final firstLeague =
+            (payload['leagues'] as List<dynamic>).first as Map<String, dynamic>;
+        final firstMatch = (firstLeague['matches'] as List<dynamic>).first
+            as Map<String, dynamic>;
+        final firstMatchId = (firstMatch['id'] as num).toInt();
+        firstMatch['prediction'] = <String, dynamic>{
+          'id': 1,
+          'match_id': firstMatchId,
+          'predicted_home_score': 2,
+          'predicted_away_score': 1,
+          'predicted_ht_home_score': 1,
+          'predicted_ht_away_score': 0,
+          'ht_ft_prediction': '1/1',
+          'top_ht_ft_json': <Map<String, dynamic>>[
+            <String, dynamic>{'code': '1/1', 'label': 'Ev / Ev', 'prob': 0.362},
+            <String, dynamic>{
+              'code': 'X/1',
+              'label': 'Beraberlik / Ev',
+              'prob': 0.184,
+            },
+            <String, dynamic>{
+              'code': 'X/X',
+              'label': 'Beraberlik / Beraberlik',
+              'prob': 0.141,
+            },
+          ],
+          'all_ht_ft_json': <Map<String, dynamic>>[
+            <String, dynamic>{'code': '1/1', 'label': 'Ev / Ev', 'prob': 0.362},
+            <String, dynamic>{
+              'code': 'X/1',
+              'label': 'Beraberlik / Ev',
+              'prob': 0.184,
+            },
+            <String, dynamic>{
+              'code': 'X/X',
+              'label': 'Beraberlik / Beraberlik',
+              'prob': 0.141,
+            },
+            <String, dynamic>{
+              'code': '2/2',
+              'label': 'Dep / Dep',
+              'prob': 0.095,
+            },
+            <String, dynamic>{
+              'code': '1/X',
+              'label': 'Ev / Beraberlik',
+              'prob': 0.068,
+            },
+            <String, dynamic>{
+              'code': 'X/2',
+              'label': 'Beraberlik / Dep',
+              'prob': 0.062,
+            },
+            <String, dynamic>{
+              'code': '2/X',
+              'label': 'Dep / Beraberlik',
+              'prob': 0.041,
+            },
+            <String, dynamic>{
+              'code': '2/1',
+              'label': 'Dep / Ev',
+              'prob': 0.026,
+            },
+            <String, dynamic>{
+              'code': '1/2',
+              'label': 'Ev / Dep',
+              'prob': 0.021,
+            },
+          ],
+          'p_home': 0.572,
+          'p_draw': 0.250,
+          'p_away': 0.178,
+          'p_over25': 0.585,
+          'p_under25': 0.415,
+          'p_btts_yes': 0.542,
+          'p_btts_no': 0.458,
+          'market_blended': true,
+          'confidence_rate': 0.42,
+          'top_scores_json': <Map<String, dynamic>>[
+            <String, dynamic>{'score': '2-1', 'prob': 0.142},
+            <String, dynamic>{'score': '1-0', 'prob': 0.118},
+            <String, dynamic>{'score': '1-1', 'prob': 0.109},
+          ],
+        };
+        (firstMatch['team_analysis']
+                as Map<String, dynamic>)['ht_ft_reasoning_text'] =
+            'İlk yarı baskısı ve ikinci yarı denge kontrolü 1/1 olasılığını destekliyor.';
+
+        final service = _createSuccessService(utf8.encode(jsonEncode(payload)));
+        await tester.pumpWidget(FutbolBulteniApp(service: service));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+
+        // MatchCard 1/X/2 + en olası İY/MS yüzdesi kontrolü
+        expect(find.text('İY/MS 1/1 %36'), findsWidgets);
+        expect(find.text('1:%57'), findsWidgets);
+        expect(find.text('X:%25'), findsWidgets);
+        expect(find.text('2:%18'), findsWidgets);
+
+        await tester.tap(find.byKey(ValueKey('match_card_$firstMatchId')));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+
+        // Olasılık Özeti Paneli (1X2 + 2.5 Üst/Alt + KG Var/Yok + Piyasa Harmanı)
+        expect(find.byType(MatchOutcomeSummaryCard), findsOneWidget);
+        expect(find.text('Piyasa + Poisson Harmanı'), findsOneWidget);
+        expect(find.text('%57.2'), findsOneWidget);
+        expect(find.text('%25.0'), findsOneWidget);
+        expect(find.text('%17.8'), findsOneWidget);
+        expect(find.text('2.5 Üst'), findsOneWidget);
+        expect(find.text('%58.5'), findsOneWidget);
+        expect(find.text('2.5 Alt'), findsOneWidget);
+        expect(find.text('%41.5'), findsOneWidget);
+        expect(find.text('KG Var'), findsOneWidget);
+        expect(find.text('%54.2'), findsOneWidget);
+        expect(find.text('KG Yok'), findsOneWidget);
+        expect(find.text('%45.8'), findsOneWidget);
+
+        // 3x3 İY/MS Tam Matris (tüm 9 hücre + satır/sütun başlıkları)
+        expect(
+          find.text('İlk Yarı / Maç Sonucu Tam Yüzdelik Matrisi (3×3)'),
+          findsOneWidget,
+        );
+        for (final code in PredictionModel.canonicalHtFtCodes) {
+          expect(find.byKey(ValueKey('ht_ft_cell_$code')), findsOneWidget);
+          expect(find.textContaining(code), findsWidgets);
+        }
+        expect(find.textContaining('%2.6'), findsOneWidget);
+        expect(find.textContaining('%2.1'), findsOneWidget);
+
+        // Tüm taktik analiz kartlarının korunması ve 360x800 kaydırmada sıfır taşma
+        final detailScroll = find.byKey(const ValueKey('match_detail_scroll'));
+        await tester.drag(detailScroll, const Offset(0, -700));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(find.text('Neden Bu Skor?'), findsOneWidget);
+        expect(
+          find.text('Kapsamlı Durum Değerlendirmesi & Neden Bu İY/MS?'),
+          findsOneWidget,
+        );
+        expect(find.text('Ev Sahibi Durumu'), findsOneWidget);
+        expect(find.text('Deplasman Durumu'), findsOneWidget);
+
+        await tester.drag(detailScroll, const Offset(0, -900));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(find.byType(RatingComparisonBar), findsOneWidget);
+        expect(find.byType(InjuriesList), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'Test 14: BulletinApiService başarılı bülteni diske kaydeder ve ağ kesildiğinde HomeScreen Çevrimdışı Önbellek bandıyla açılır',
+      (WidgetTester tester) async {
+        tester.view.physicalSize = const Size(360, 800);
+        tester.view.devicePixelRatio = 1.0;
+        final tempDir = Directory.systemTemp.createTempSync(
+          'futbol_offline_cache_test_',
+        );
+        const storageChannel = MethodChannel('com.futbol.bulten/storage');
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(storageChannel, (call) async {
+          if (call.method == 'getFilesDir') {
+            return tempDir.path;
+          }
+          return null;
+        });
+
+        addTearDown(() {
+          tester.view.resetPhysicalSize();
+          tester.view.resetDevicePixelRatio();
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+              .setMockMethodCallHandler(storageChannel, null);
+          if (tempDir.existsSync()) {
+            tempDir.deleteSync(recursive: true);
+          }
+        });
+
+        // 1. Canlı HTTP 200 yanıtı yerel önbellek dosyasına kaydedilir
+        var shouldFail = false;
+        final client = MockClient((_) async {
+          if (shouldFail) {
+            throw const SocketException('İnternet bağlantısı yok');
+          }
+          return http.Response.bytes(
+            realBulletinBytes,
+            200,
+            headers: const {'content-type': 'application/json; charset=utf-8'},
+          );
+        });
+
+        final service = BulletinApiService(
+          client: client,
+          enableOfflineCache: true,
+        );
+        final liveData = await service.fetchBulletin();
+        expect(liveData.isOfflineCache, isFalse);
+
+        final savedCacheFile = File(
+          '${tempDir.path}/${BulletinApiService.defaultCacheFileName}',
+        );
+        expect(savedCacheFile.existsSync(), isTrue);
+        expect(savedCacheFile.readAsStringSync(), isNotEmpty);
+
+        // 2. Ağ kesildiğinde hata ekranı yerine önbellekteki bülten ve Çevrimdışı Önbellek bandı gösterilir
+        shouldFail = true;
+        await tester.pumpWidget(FutbolBulteniApp(service: service));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+
+        expect(
+          find.byKey(const ValueKey('offline_cache_banner')),
+          findsOneWidget,
+        );
+        expect(
+          find.textContaining('Çevrimdışı Önbellek • Son güncelleme:'),
+          findsOneWidget,
+        );
+        expect(find.text('Çevrimdışı'), findsOneWidget);
+        expect(find.byType(MatchCard), findsWidgets);
+        expect(
+          find.text('Sunucuya bağlanılamadı, tekrar dene'),
+          findsNothing,
+        );
+
+        // 3. Ağ geri geldiğinde Yenile butonu canlı bültene geçirir
+        shouldFail = false;
+        await tester.tap(find.byKey(const ValueKey('offline_retry_button')));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(
+          find.byKey(const ValueKey('offline_cache_banner')),
+          findsNothing,
+        );
+        expect(find.text('Canlı'), findsOneWidget);
       },
     );
   });

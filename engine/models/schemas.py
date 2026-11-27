@@ -24,7 +24,18 @@ HT_FT_LABELS_TR: dict[str, str] = {
     "2/X": "Dep / Beraberlik",
     "2/2": "Dep / Dep",
 }
-VALID_HT_FT_CODES: frozenset[str] = frozenset(HT_FT_LABELS_TR.keys())
+ALL_HT_FT_CODES: tuple[str, ...] = (
+    "1/1",
+    "X/1",
+    "2/1",
+    "1/X",
+    "X/X",
+    "2/X",
+    "1/2",
+    "X/2",
+    "2/2",
+)
+VALID_HT_FT_CODES: frozenset[str] = frozenset(ALL_HT_FT_CODES)
 
 
 class MatchStatus(StrEnum):
@@ -160,6 +171,16 @@ class Prediction(DBModel):
         "predicted_ht_away_score",
         "ht_ft_prediction",
         "top_ht_ft_json",
+        "all_ht_ft_json",
+        "p_home",
+        "p_draw",
+        "p_away",
+        "p_over25",
+        "p_under25",
+        "p_btts_yes",
+        "p_btts_no",
+        "market_blended",
+        "market_blend_weight",
     )
 
     id: int | None = None
@@ -170,8 +191,18 @@ class Prediction(DBModel):
     predicted_ht_away_score: int = Field(default=0, ge=0)
     ht_ft_prediction: str = Field(default="X/X")
     top_ht_ft_json: list[HtFtProbability] = Field(default_factory=list)
+    all_ht_ft_json: list[HtFtProbability] = Field(default_factory=list)
     confidence_rate: float = Field(..., ge=0.0)
     top_scores_json: list[ScoreProbability] = Field(default_factory=list)
+    p_home: float = Field(default=0.0, ge=0.0, le=1.0)
+    p_draw: float = Field(default=0.0, ge=0.0, le=1.0)
+    p_away: float = Field(default=0.0, ge=0.0, le=1.0)
+    p_over25: float = Field(default=0.0, ge=0.0, le=1.0)
+    p_under25: float = Field(default=0.0, ge=0.0, le=1.0)
+    p_btts_yes: float = Field(default=0.0, ge=0.0, le=1.0)
+    p_btts_no: float = Field(default=0.0, ge=0.0, le=1.0)
+    market_blended: bool = False
+    market_blend_weight: float = Field(default=0.0, ge=0.0, le=1.0)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

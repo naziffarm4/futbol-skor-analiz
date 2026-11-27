@@ -27,6 +27,14 @@ def make_source_diagnostic(
     }
 
 
+from engine.scrapers.sources.api_football import (  # noqa: E402
+    ApiFootballAdapter,
+    ApiFootballLeagueData,
+    QuotaBudgetTracker,
+    parse_api_football_fixtures,
+    parse_api_football_injuries,
+    redact_secret,
+)
 from engine.scrapers.sources.espn import (  # noqa: E402
     ESPN_LEAGUE_SLUGS,
     ESPNAdapter,
@@ -49,6 +57,14 @@ from engine.scrapers.sources.secondary_check import (  # noqa: E402
     SecondaryStandingRecord,
     parse_sportsgambler_html,
 )
+from engine.scrapers.sources.the_odds_api import (  # noqa: E402
+    MarketMatchOdds,
+    TheOddsApiAdapter,
+    TheOddsLeagueData,
+    devig_three_way,
+    devig_two_way,
+    parse_the_odds_events,
+)
 from engine.scrapers.sources.understat import (  # noqa: E402
     UNDERSTAT_LEAGUE_SLUGS,
     UnderstatAdapter,
@@ -62,6 +78,8 @@ __all__ = [
     "ESPN_LEAGUE_SLUGS",
     "FOOTBALL_DATA_CODES",
     "UNDERSTAT_LEAGUE_SLUGS",
+    "ApiFootballAdapter",
+    "ApiFootballLeagueData",
     "ESPNAdapter",
     "ESPNFixtureRecord",
     "ESPNLeagueData",
@@ -70,16 +88,26 @@ __all__ = [
     "FootballDataLeagueData",
     "FootballDataMatchRow",
     "FootballDataTeamStats",
+    "MarketMatchOdds",
+    "QuotaBudgetTracker",
     "SecondaryCheckAdapter",
     "SecondaryCheckData",
     "SecondaryInjuryRecord",
     "SecondaryStandingRecord",
+    "TheOddsApiAdapter",
+    "TheOddsLeagueData",
     "UnderstatAdapter",
     "UnderstatLeagueData",
     "UnderstatTeamXG",
     "derive_xg_from_shots",
+    "devig_three_way",
+    "devig_two_way",
     "make_source_diagnostic",
+    "parse_api_football_fixtures",
+    "parse_api_football_injuries",
     "parse_football_data_csv",
     "parse_sportsgambler_html",
+    "parse_the_odds_events",
     "parse_understat_teams_data",
+    "redact_secret",
 ]

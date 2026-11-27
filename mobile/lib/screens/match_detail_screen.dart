@@ -60,10 +60,17 @@ class MatchDetailScreen extends StatelessWidget {
           children: [
             _HeroMatchBanner(match: match),
             const SizedBox(height: 16),
+            MatchOutcomeSummaryCard(prediction: match.prediction),
+            const SizedBox(height: 16),
             ScoreProbabilityBar(topScores: match.prediction.topScores),
-            if (match.prediction.topHtFt.isNotEmpty) ...[
+            if (match.prediction.topHtFt.isNotEmpty ||
+                match.prediction.allHtFt.isNotEmpty) ...[
               const SizedBox(height: 16),
-              HtFtProbabilityBar(topHtFt: match.prediction.topHtFt),
+              HtFtProbabilityBar(
+                topHtFt: match.prediction.topHtFt,
+                allHtFt: match.prediction.allHtFt,
+                highlightedCode: match.prediction.htFtPrediction,
+              ),
             ],
             const SizedBox(height: 18),
             AnalysisSection(

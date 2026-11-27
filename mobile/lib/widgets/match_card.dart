@@ -221,32 +221,69 @@ class MatchCard extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 10),
-              Center(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 4,
-                  ),
-                  decoration: BoxDecoration(
-                    color: AppColors.neonBlue.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(
-                      color: AppColors.neonBlue.withValues(alpha: 0.42),
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppColors.neonBlue.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: AppColors.neonBlue.withValues(alpha: 0.42),
+                      ),
+                    ),
+                    child: Text(
+                      match.prediction.compactHtFtBadge,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: AppColors.neonBlue,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.15,
+                      ),
                     ),
                   ),
-                  child: Text(
-                    match.prediction.compactHtFtBadge,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: AppColors.neonBlue,
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 0.2,
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppColors.neonOrange.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: AppColors.neonOrange.withValues(alpha: 0.48),
+                      ),
+                    ),
+                    child: Text(
+                      match.prediction.bestHtFtBadge,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: AppColors.neonOrange,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.15,
+                      ),
                     ),
                   ),
-                ),
+                ],
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: 8),
+              _Compact1X2Row(
+                pHome: match.prediction.pHome,
+                pDraw: match.prediction.pDraw,
+                pAway: match.prediction.pAway,
+                homeLabel: '1:${match.prediction.pHomeShort}',
+                drawLabel: 'X:${match.prediction.pDrawShort}',
+                awayLabel: '2:${match.prediction.pAwayShort}',
+              ),
+              const SizedBox(height: 12),
               const Divider(height: 1),
               const SizedBox(height: 12),
 
@@ -335,6 +372,87 @@ class MatchCard extends StatelessWidget {
                 ],
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Compact1X2Row extends StatelessWidget {
+  final double pHome;
+  final double pDraw;
+  final double pAway;
+  final String homeLabel;
+  final String drawLabel;
+  final String awayLabel;
+
+  const _Compact1X2Row({
+    required this.pHome,
+    required this.pDraw,
+    required this.pAway,
+    required this.homeLabel,
+    required this.drawLabel,
+    required this.awayLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final homeLead = pHome >= pDraw && pHome >= pAway;
+    final drawLead = !homeLead && pDraw >= pAway;
+    final awayLead = !homeLead && !drawLead;
+
+    return Row(
+      children: [
+        Expanded(
+          child: _MiniProbChip(text: homeLabel, highlighted: homeLead),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: _MiniProbChip(text: drawLabel, highlighted: drawLead),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: _MiniProbChip(text: awayLabel, highlighted: awayLead),
+        ),
+      ],
+    );
+  }
+}
+
+class _MiniProbChip extends StatelessWidget {
+  final String text;
+  final bool highlighted;
+
+  const _MiniProbChip({
+    required this.text,
+    required this.highlighted,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: highlighted
+            ? AppColors.neonGreen.withValues(alpha: 0.13)
+            : AppColors.cardElevated.withValues(alpha: 0.75),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: highlighted
+              ? AppColors.neonGreen.withValues(alpha: 0.5)
+              : AppColors.border,
+        ),
+      ),
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Text(
+          text,
+          style: TextStyle(
+            color: highlighted ? AppColors.neonGreen : AppColors.textSecondary,
+            fontSize: 11.5,
+            fontWeight: highlighted ? FontWeight.w800 : FontWeight.w600,
           ),
         ),
       ),

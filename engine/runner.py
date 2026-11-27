@@ -268,6 +268,7 @@ def run_full_cycle(
     all_source_diagnostics: dict[str, dict[str, Any]] = {}
     all_league_sources: dict[str, dict[str, Any]] = {}
     all_team_metrics: dict[Any, Any] = {}
+    all_market_odds: dict[Any, Any] = {}
 
     try:
         for lid in target_leagues:
@@ -279,6 +280,7 @@ def run_full_cycle(
                 logger.info("Lig senkronizasyonu başlatıldı: %s", lid.value)
                 ing_res = pipeline.run_league(lid, persist=persist)
                 ing_team_metrics = getattr(ing_res, "team_metrics", None)
+                ing_market_odds = getattr(ing_res, "market_odds", None)
                 pred_kwargs: dict[str, Any] = {
                     "matches": ing_res.matches,
                     "injuries": ing_res.injuries,
@@ -290,6 +292,10 @@ def run_full_cycle(
                     pred_kwargs["team_metrics"] = ing_team_metrics
                     if isinstance(ing_team_metrics, Mapping):
                         all_team_metrics.update(ing_team_metrics)
+                if ing_market_odds:
+                    pred_kwargs["market_odds"] = ing_market_odds
+                    if isinstance(ing_market_odds, Mapping):
+                        all_market_odds.update(ing_market_odds)
 
                 pred_res = predictor.run(**pred_kwargs)
 
@@ -373,6 +379,8 @@ def run_full_cycle(
 
         if all_team_metrics:
             _try_assign_ingestion_attr(combined_ingestion, "team_metrics", all_team_metrics)
+        if all_market_odds:
+            _try_assign_ingestion_attr(combined_ingestion, "market_odds", all_market_odds)
         if all_sources_used:
             _try_assign_ingestion_attr(combined_ingestion, "sources_used", all_sources_used)
         _try_assign_ingestion_attr(combined_ingestion, "sources_total", sources_total)

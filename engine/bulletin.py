@@ -14,6 +14,7 @@ from typing import Any
 
 from engine.config import DEFAULT_SEASON, LEAGUES, PROJECT_ROOT, LeagueId
 from engine.models.schemas import Injury, League, Match, MatchStatus, Team
+from engine.predictors.poisson import predict_score_distribution
 from engine.predictors.service import MatchPredictionBundle, select_next_round
 from engine.runner import CycleResult
 
@@ -87,6 +88,54 @@ def _format_data_source_label(sources_used: list[str]) -> str:
     if len(sources_used) > 1:
         return f"{len(sources_used)} Kaynak Füzyonu ({', '.join(sources_used)})"
     return sources_used[0] if sources_used else "Transfermarkt"
+
+
+def _rating_to_strength(rating: float) -> float:
+    clamped = min(96.0, max(8.0, float(rating)))
+    curved = 0.65 * clamped / (100.0 - clamped)
+    return float(curved ** (1.0 / 1.35))
+
+
+def _ensure_league_predictions_upgraded(lg_dict: dict[str, Any]) -> None:
+    """Önceki önbellekten korunan liglerde 9'lu İY/MS ve olasılık alanları eksikse tamamlar."""
+    matches = lg_dict.get("matches")
+    if not isinstance(matches, list):
+        return
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        pred = match.get("prediction")
+        if not isinstance(pred, dict):
+            continue
+        all_ht_ft = pred.get("all_ht_ft_json")
+        if isinstance(all_ht_ft, list) and len(all_ht_ft) == 9 and "p_home" in pred:
+            continue
+        ta = match.get("team_analysis")
+        ta_map = ta if isinstance(ta, Mapping) else {}
+        h_att = _rating_to_strength(float(ta_map.get("home_offense_rating", 60.0)))
+        h_def = 1.0 / max(0.35, _rating_to_strength(float(ta_map.get("home_defense_rating", 60.0))))
+        a_att = _rating_to_strength(float(ta_map.get("away_offense_rating", 58.0)))
+        a_def = 1.0 / max(0.35, _rating_to_strength(float(ta_map.get("away_defense_rating", 58.0))))
+        p_res = predict_score_distribution(
+            home_attack=h_att,
+            away_defense=a_def,
+            away_attack=a_att,
+            home_defense=h_def,
+        )
+        pred["all_ht_ft_json"] = [
+            {"code": h.code, "label": h.label, "prob": float(h.prob)} for h in p_res.all_ht_ft
+        ]
+        if not pred.get("top_ht_ft_json"):
+            pred["top_ht_ft_json"] = pred["all_ht_ft_json"][:3]
+        pred.setdefault("p_home", float(p_res.home_win_prob))
+        pred.setdefault("p_draw", float(p_res.draw_prob))
+        pred.setdefault("p_away", float(p_res.away_win_prob))
+        pred.setdefault("p_over25", float(p_res.over_25_prob))
+        pred.setdefault("p_under25", float(p_res.under_25_prob))
+        pred.setdefault("p_btts_yes", float(p_res.btts_yes_prob))
+        pred.setdefault("p_btts_no", float(p_res.btts_no_prob))
+        pred.setdefault("market_blended", False)
+        pred.setdefault("market_blend_weight", 0.0)
 
 
 def _build_leagues_meta(leagues_payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -227,6 +276,7 @@ def build_bulletin_payload(
                 if isinstance(preserved_lg.get("source_diagnostics"), Mapping)
                 else {}
             )
+            _ensure_league_predictions_upgraded(preserved_lg)
             leagues_out.append(preserved_lg)
             continue
         if lid not in ingested_leagues:
@@ -352,11 +402,24 @@ def build_bulletin_payload(
                             {"code": h.code, "label": h.label, "prob": float(h.prob)}
                             for h in pred.top_ht_ft_json
                         ],
+                        "all_ht_ft_json": [
+                            {"code": h.code, "label": h.label, "prob": float(h.prob)}
+                            for h in pred.all_ht_ft_json
+                        ],
                         "confidence_rate": float(pred.confidence_rate),
                         "top_scores_json": [
                             {"score": sp.score, "prob": float(sp.prob)}
                             for sp in pred.top_scores_json
                         ],
+                        "p_home": float(pred.p_home),
+                        "p_draw": float(pred.p_draw),
+                        "p_away": float(pred.p_away),
+                        "p_over25": float(pred.p_over25),
+                        "p_under25": float(pred.p_under25),
+                        "p_btts_yes": float(pred.p_btts_yes),
+                        "p_btts_no": float(pred.p_btts_no),
+                        "market_blended": bool(pred.market_blended),
+                        "market_blend_weight": float(pred.market_blend_weight),
                     },
                     "team_analysis": {
                         "id": ta.id if ta.id is not None else resolved_mid,
@@ -500,6 +563,7 @@ def load_bulletin_from_disk(*, cache_path: Path | None = None) -> dict[str, Any]
         raw["data_source"] = _format_data_source_label(raw_sources)
     for lg in raw["leagues"]:
         if isinstance(lg, dict):
+            _ensure_league_predictions_upgraded(lg)
             if "played_matches_count" not in lg:
                 lg["played_matches_count"] = 0
             lg_sources = _normalize_sources_list(lg.get("sources_used")) or list(raw_sources)

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +20,7 @@ from engine.models.schemas import Injury, Match, MatchStatus, Prediction, Team, 
 from engine.predictors.analyst import generate_match_analysis_texts
 from engine.predictors.poisson import PoissonPredictionResult, predict_score_distribution
 from engine.predictors.ratings import (
+    DEFAULT_TIME_DECAY_XI,
     TeamRatingProfile,
     build_team_ratings,
     calculate_league_baseline,
@@ -55,6 +59,129 @@ class PredictionServiceResult:
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+
+
+_TR_TRANSLATION = str.maketrans("ıİğĞüÜşŞöÖçÇ", "iiggüüssoocc")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _norm_team_name(raw: str) -> str:
+    folded = unicodedata.normalize("NFKD", raw.translate(_TR_TRANSLATION)).casefold()
+    ascii_only = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return _NON_ALNUM_RE.sub(" ", ascii_only).strip()
+
+
+def _coerce_market_probs_entry(raw_entry: Any) -> dict[str, float] | None:
+    if raw_entry is None:
+        return None
+    if isinstance(raw_entry, (tuple, list)) and len(raw_entry) >= 3:
+        try:
+            th, td, ta = float(raw_entry[0]), float(raw_entry[1]), float(raw_entry[2])
+        except (TypeError, ValueError):
+            return None
+        if th > 0.0 and td > 0.0 and ta > 0.0 and math.isfinite(th + td + ta):
+            ts = th + td + ta
+            return {"p_home": th / ts, "p_draw": td / ts, "p_away": ta / ts}
+        return None
+
+    def _read(*keys: str) -> float | None:
+        for k in keys:
+            val = raw_entry.get(k) if isinstance(raw_entry, Mapping) else getattr(raw_entry, k, None)
+            if val is None or isinstance(val, bool):
+                continue
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fval):
+                return fval
+        return None
+
+    ph = _read("p_home", "home_prob", "prob_home")
+    pd = _read("p_draw", "draw_prob", "prob_draw")
+    pa = _read("p_away", "away_prob", "prob_away")
+    if ph is None or pd is None or pa is None:
+        oh = _read("home_odd", "odd_home", "odds_home")
+        od = _read("draw_odd", "odd_draw", "odds_draw")
+        oa = _read("away_odd", "odd_away", "odds_away")
+        if oh is not None and od is not None and oa is not None and oh > 1.0 and od > 1.0 and oa > 1.0:
+            ih, id_, ia = 1.0 / oh, 1.0 / od, 1.0 / oa
+            tot = ih + id_ + ia
+            ph, pd, pa = ih / tot, id_ / tot, ia / tot
+    if ph is None or pd is None or pa is None or ph <= 0.0 or pd <= 0.0 or pa <= 0.0:
+        return None
+
+    s = ph + pd + pa
+    out: dict[str, float] = {"p_home": ph / s, "p_draw": pd / s, "p_away": pa / s}
+    po25 = _read("p_over25", "over_25_prob", "over25_prob", "p_over_2_5")
+    if po25 is None:
+        oo = _read("over25_odd", "odd_over25")
+        ou = _read("under25_odd", "odd_under25")
+        if oo is not None and ou is not None and oo > 1.0 and ou > 1.0:
+            po25 = (1.0 / oo) / ((1.0 / oo) + (1.0 / ou))
+    if po25 is not None and 0.0 < po25 < 1.0:
+        out["p_over25"] = po25
+        out["p_under25"] = 1.0 - po25
+    pbtts = _read("p_btts_yes", "btts_yes_prob")
+    if pbtts is not None and 0.0 < pbtts < 1.0:
+        out["p_btts_yes"] = pbtts
+    return out
+
+
+def _resolve_match_market_probs(
+    market_odds: Mapping[Any, Any] | None,
+    *,
+    match: Match,
+    resolved_id: int,
+    home_name: str,
+    away_name: str,
+) -> dict[str, float] | None:
+    if not market_odds:
+        return None
+
+    nh = _norm_team_name(home_name)
+    na = _norm_team_name(away_name)
+    ch = home_name.strip().casefold()
+    ca = away_name.strip().casefold()
+
+    candidate_keys: list[Any] = [
+        (match.home_team_id, match.away_team_id),
+    ]
+    if match.id is not None:
+        candidate_keys.extend([match.id, str(match.id)])
+    candidate_keys.extend(
+        [
+            resolved_id,
+            str(resolved_id),
+            (home_name, away_name),
+            (ch, ca),
+            (nh, na),
+            f"{nh}|{na}",
+            f"{nh}:{na}",
+            f"{nh}-{na}",
+            f"{nh} vs {na}",
+        ]
+    )
+
+    for key in candidate_keys:
+        if key in market_odds:
+            coerced = _coerce_market_probs_entry(market_odds[key])
+            if coerced is not None:
+                return coerced
+
+    for raw_key, raw_val in market_odds.items():
+        if (
+            isinstance(raw_key, tuple)
+            and len(raw_key) == 2
+            and isinstance(raw_key[0], str)
+            and isinstance(raw_key[1], str)
+            and _norm_team_name(raw_key[0]) == nh
+            and _norm_team_name(raw_key[1]) == na
+        ):
+            coerced = _coerce_market_probs_entry(raw_val)
+            if coerced is not None:
+                return coerced
+    return None
 
 
 def _resolve_team_names(
@@ -181,10 +308,13 @@ class PredictionService:
         injuries: Sequence[Injury] = (),
         teams: Sequence[Team] | Mapping[int, Team | str] | None = None,
         team_metrics: Mapping[Any, Any] | None = None,
+        market_odds: Mapping[Any, Any] | None = None,
         round_filter: int | None = None,
         only_next_round: bool = False,
         persist: bool = False,
         rho: float = -0.10,
+        time_decay_xi: float | None = None,
+        market_blend_alpha: float | None = None,
     ) -> PredictionServiceResult:
         """Verilen fikstür ve sakatlıklarla her SCHEDULED maç için Prediction ve TeamAnalysis üretir."""
         finished_list = (
@@ -236,12 +366,14 @@ class PredictionService:
             lg_injuries = [inj for inj in injuries if inj.team_id in lg_team_ids]
             lg_metrics = _resolve_league_team_metrics(team_metrics, lg_team_ids, team_names)
 
-            baseline = calculate_league_baseline(lg_finished)
+            effective_xi = DEFAULT_TIME_DECAY_XI if time_decay_xi is None else time_decay_xi
+            baseline = calculate_league_baseline(lg_finished, time_decay_xi=effective_xi)
             profiles = build_team_ratings(
                 lg_all_matches,
                 lg_injuries,
                 team_ids=lg_team_ids,
                 team_metrics=lg_metrics,
+                time_decay_xi=effective_xi,
             )
 
             db_id_lookup = (
@@ -264,6 +396,16 @@ class PredictionService:
                 away_prof = profiles[match.away_team_id]
                 sample_depth = min(home_prof.played, away_prof.played)
 
+                home_name = team_names.get(match.home_team_id, f"Takım #{match.home_team_id}")
+                away_name = team_names.get(match.away_team_id, f"Takım #{match.away_team_id}")
+                match_market_probs = _resolve_match_market_probs(
+                    market_odds,
+                    match=match,
+                    resolved_id=resolved_id,
+                    home_name=home_name,
+                    away_name=away_name,
+                )
+
                 poisson_res = predict_score_distribution(
                     home_attack=home_prof.adjusted_home_attack,
                     away_defense=away_prof.adjusted_away_defense,
@@ -277,10 +419,9 @@ class PredictionService:
                     away_ht_concede_share=away_prof.first_half_concede_share,
                     away_ht_attack_share=away_prof.first_half_attack_share,
                     home_ht_concede_share=home_prof.first_half_concede_share,
+                    market_probs=match_market_probs,
+                    market_blend_alpha=market_blend_alpha,
                 )
-
-                home_name = team_names.get(match.home_team_id, f"Takım #{match.home_team_id}")
-                away_name = team_names.get(match.away_team_id, f"Takım #{match.away_team_id}")
 
                 texts = generate_match_analysis_texts(
                     home_name=home_name,
@@ -289,6 +430,7 @@ class PredictionService:
                     away_profile=away_prof,
                     poisson_result=poisson_res,
                     round_number=match.round,
+                    market_probs=match_market_probs,
                 )
 
                 prediction = Prediction(
@@ -299,8 +441,18 @@ class PredictionService:
                     predicted_ht_away_score=poisson_res.predicted_ht_away_score,
                     ht_ft_prediction=poisson_res.ht_ft_prediction,
                     top_ht_ft_json=poisson_res.top_ht_ft,
+                    all_ht_ft_json=poisson_res.all_ht_ft,
                     confidence_rate=poisson_res.confidence_rate,
                     top_scores_json=poisson_res.top_scores,
+                    p_home=poisson_res.home_win_prob,
+                    p_draw=poisson_res.draw_prob,
+                    p_away=poisson_res.away_win_prob,
+                    p_over25=poisson_res.over_25_prob,
+                    p_under25=poisson_res.under_25_prob,
+                    p_btts_yes=poisson_res.btts_yes_prob,
+                    p_btts_no=poisson_res.btts_no_prob,
+                    market_blended=poisson_res.market_blended,
+                    market_blend_weight=poisson_res.market_blend_weight,
                 )
                 analysis = TeamAnalysis(
                     match_id=resolved_id,
@@ -354,10 +506,13 @@ def run_prediction_pipeline(
     injuries: Sequence[Injury] = (),
     teams: Sequence[Team] | Mapping[int, Team | str] | None = None,
     team_metrics: Mapping[Any, Any] | None = None,
+    market_odds: Mapping[Any, Any] | None = None,
     round_filter: int | None = None,
     only_next_round: bool = False,
     persist: bool = False,
     as_dict: bool = False,
+    time_decay_xi: float | None = None,
+    market_blend_alpha: float | None = None,
 ) -> PredictionServiceResult | dict[str, Any]:
     """Tek çağrımlık tahmin ve analiz orkestratör fonksiyonu."""
     service = PredictionService()
@@ -368,8 +523,11 @@ def run_prediction_pipeline(
         injuries=injuries,
         teams=teams,
         team_metrics=team_metrics,
+        market_odds=market_odds,
         round_filter=round_filter,
         only_next_round=only_next_round,
         persist=persist,
+        time_decay_xi=time_decay_xi,
+        market_blend_alpha=market_blend_alpha,
     )
     return res.to_dict() if as_dict else res

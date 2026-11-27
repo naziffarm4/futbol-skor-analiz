@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from engine.models.schemas import ALL_HT_FT_CODES
+
 EPSILON = 1e-15
 
 ODDS_1X2_PRIORITY: tuple[tuple[str, str, str, str], ...] = (
@@ -45,6 +47,10 @@ class MatchEvaluationRecord:
     p_over25: float | None = None
     expected_home_goals: float | None = None
     expected_away_goals: float | None = None
+    ht_home_goals: int | None = None
+    ht_away_goals: int | None = None
+    actual_ht_ft: str | None = None
+    ht_ft_probs: dict[str, float] | None = None
 
 
 @dataclass(slots=True)
@@ -62,7 +68,7 @@ class CalibrationBucket:
 
 @dataclass(slots=True)
 class ModelSummaryMetrics:
-    """Toplu maç kümesi üzerinde hesaplanan sıralı/çok sınıflı ve Üst 2.5 kalibrasyon metrikleri."""
+    """Toplu maç kümesi üzerinde hesaplanan sıralı/çok sınıflı, Üst 2.5 ve 9'lu İY/MS metrikleri."""
 
     model_name: str
     matches: int
@@ -82,6 +88,15 @@ class ModelSummaryMetrics:
     over25_calibration_gap: float | None
     brier_over25: float | None
     log_loss_over25: float | None
+    accuracy_over25: float | None = None
+    ht_ft_matches: int = 0
+    brier_ht_ft: float | None = None
+    log_loss_ht_ft: float | None = None
+    ht_ft_top1_accuracy: float | None = None
+    ht_ft_top3_accuracy: float | None = None
+
+
+MetricsSummary = ModelSummaryMetrics
 
 
 def outcome_one_hot(home_goals: int, away_goals: int) -> tuple[int, int, int]:
@@ -224,15 +239,60 @@ def extract_market_1x2_probs(
     return None, None
 
 
-def extract_market_over25_prob(row: Mapping[str, Any]) -> tuple[float | None, str | None]:
-    """CSV satırından öncelik sırasına göre marjsız Üst 2.5 olasılığını çıkarır."""
+def actual_ht_ft_code(ht_home: int, ht_away: int, ft_home: int, ft_away: int) -> str:
+    """Gerçekleşen İY ve MS gol sayılarından 9 yönlü İY/MS kodunu ('1/1'..'2/2') üretir."""
+    ht_s = "1" if ht_home > ht_away else ("X" if ht_home == ht_away else "2")
+    ft_s = "1" if ft_home > ft_away else ("X" if ft_home == ft_away else "2")
+    return f"{ht_s}/{ft_s}"
+
+
+def _normalize_ht_ft_probs(ht_ft_probs: Mapping[str, float]) -> dict[str, float]:
+    vals = {c: max(0.0, float(ht_ft_probs.get(c, 0.0))) for c in ALL_HT_FT_CODES}
+    tot = sum(vals.values())
+    if tot <= 0.0 or not math.isfinite(tot):
+        u = 1.0 / len(ALL_HT_FT_CODES)
+        return {c: u for c in ALL_HT_FT_CODES}
+    return {c: v / tot for c, v in vals.items()}
+
+
+def ht_ft_multiclass_brier(ht_ft_probs: Mapping[str, float], actual_code: str) -> float:
+    """9 yönlü İY/MS çok sınıflı Brier skoru: sum_{c in 9} (p_c - y_c)^2 ([0, 2] aralığında)."""
+    normed = _normalize_ht_ft_probs(ht_ft_probs)
+    return sum((normed[c] - (1.0 if c == actual_code else 0.0)) ** 2 for c in ALL_HT_FT_CODES)
+
+
+def ht_ft_log_loss(ht_ft_probs: Mapping[str, float], actual_code: str) -> float:
+    """9 yönlü İY/MS gerçekleşen sınıfının negatif doğal logaritması (-ln p_gerçek)."""
+    normed = _normalize_ht_ft_probs(ht_ft_probs)
+    target_p = normed.get(actual_code, 0.0)
+    return -math.log(max(EPSILON, min(1.0, target_p)))
+
+
+def ht_ft_top_k_hit(ht_ft_probs: Mapping[str, float], actual_code: str, k: int = 1) -> bool:
+    """En yüksek olasılıklı ilk k İY/MS tahmini içinde gerçekleşen kod var mı?"""
+    normed = _normalize_ht_ft_probs(ht_ft_probs)
+    ranked = sorted(ALL_HT_FT_CODES, key=lambda c: (-normed[c], ALL_HT_FT_CODES.index(c)))
+    return actual_code in ranked[: max(1, k)]
+
+
+def extract_market_over_under25_probs(
+    row: Mapping[str, Any],
+) -> tuple[tuple[float, float] | None, str | None]:
+    """CSV satırından öncelik sırasına göre marjsız (Üst 2.5, Alt 2.5) olasılık ikilisini çıkarır."""
     for o_col, u_col, label in ODDS_OVER25_PRIORITY:
         oo = _parse_positive_odd(row, o_col)
         ou = _parse_positive_odd(row, u_col)
         if oo is not None and ou is not None:
-            p_over, _ = devig_two_way_odds(oo, ou)
-            return p_over, label
+            return devig_two_way_odds(oo, ou), label
     return None, None
+
+
+def extract_market_over25_prob(row: Mapping[str, Any]) -> tuple[float | None, str | None]:
+    """CSV satırından öncelik sırasına göre marjsız Üst 2.5 olasılığını çıkarır."""
+    pair, label = extract_market_over_under25_probs(row)
+    if pair is None:
+        return None, None
+    return pair[0], label
 
 
 def summarize_records(
@@ -306,6 +366,7 @@ def summarize_records(
     o25_gap: float | None = None
     o25_brier: float | None = None
     o25_ll: float | None = None
+    o25_acc: float | None = None
     if over_records:
         m_cnt = len(over_records)
         sub_actual_rate = (
@@ -327,7 +388,57 @@ def summarize_records(
             )
             / m_cnt
         )
+        o25_acc = (
+            sum(
+                1
+                for r in over_records
+                if (float(r.p_over25 or 0.0) >= 0.5) == ((r.home_goals + r.away_goals) >= 3)
+            )
+            / m_cnt
+        )
         all_over_rate = sub_actual_rate
+
+    ht_ft_records = [
+        r
+        for r in records
+        if r.ht_ft_probs is not None and r.actual_ht_ft is not None
+    ]
+    ht_ft_cnt = len(ht_ft_records)
+    ht_ft_brier: float | None = None
+    ht_ft_ll: float | None = None
+    ht_ft_t1: float | None = None
+    ht_ft_t3: float | None = None
+    if ht_ft_cnt > 0:
+        ht_ft_brier = (
+            sum(
+                ht_ft_multiclass_brier(r.ht_ft_probs or {}, str(r.actual_ht_ft))
+                for r in ht_ft_records
+            )
+            / ht_ft_cnt
+        )
+        ht_ft_ll = (
+            sum(
+                ht_ft_log_loss(r.ht_ft_probs or {}, str(r.actual_ht_ft))
+                for r in ht_ft_records
+            )
+            / ht_ft_cnt
+        )
+        ht_ft_t1 = (
+            sum(
+                1
+                for r in ht_ft_records
+                if ht_ft_top_k_hit(r.ht_ft_probs or {}, str(r.actual_ht_ft), k=1)
+            )
+            / ht_ft_cnt
+        )
+        ht_ft_t3 = (
+            sum(
+                1
+                for r in ht_ft_records
+                if ht_ft_top_k_hit(r.ht_ft_probs or {}, str(r.actual_ht_ft), k=3)
+            )
+            / ht_ft_cnt
+        )
 
     mean_act_h = act_h_sum / n
     mean_act_a = act_a_sum / n
@@ -351,6 +462,12 @@ def summarize_records(
         over25_calibration_gap=round(o25_gap, 5) if o25_gap is not None else None,
         brier_over25=round(o25_brier, 5) if o25_brier is not None else None,
         log_loss_over25=round(o25_ll, 5) if o25_ll is not None else None,
+        accuracy_over25=round(o25_acc, 5) if o25_acc is not None else None,
+        ht_ft_matches=ht_ft_cnt,
+        brier_ht_ft=round(ht_ft_brier, 5) if ht_ft_brier is not None else None,
+        log_loss_ht_ft=round(ht_ft_ll, 5) if ht_ft_ll is not None else None,
+        ht_ft_top1_accuracy=round(ht_ft_t1, 5) if ht_ft_t1 is not None else None,
+        ht_ft_top3_accuracy=round(ht_ft_t3, 5) if ht_ft_t3 is not None else None,
     )
 
 

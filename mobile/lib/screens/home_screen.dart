@@ -102,13 +102,18 @@ class _HomeScreenState extends State<HomeScreen> {
                     vertical: 4,
                   ),
                   decoration: BoxDecoration(
-                    color: AppColors.neonGreen.withValues(alpha: 0.14),
+                    color: (bulletin.isOfflineCache
+                            ? AppColors.neonOrange
+                            : AppColors.neonGreen)
+                        .withValues(alpha: 0.14),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Text(
-                    'Canlı',
+                  child: Text(
+                    bulletin.isOfflineCache ? 'Çevrimdışı' : 'Canlı',
                     style: TextStyle(
-                      color: AppColors.neonGreen,
+                      color: bulletin.isOfflineCache
+                          ? AppColors.neonOrange
+                          : AppColors.neonGreen,
                       fontSize: 11,
                       fontWeight: FontWeight.w700,
                     ),
@@ -216,7 +221,7 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    return TabBarView(
+    final tabView = TabBarView(
       children: [
         for (final league in leagues)
           Builder(
@@ -240,6 +245,93 @@ class _HomeScreenState extends State<HomeScreen> {
             },
           ),
       ],
+    );
+
+    if (!bulletin.isOfflineCache) {
+      return tabView;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _OfflineCacheBanner(
+          formattedTimestamp: bulletin.formattedGeneratedAt,
+          isLoading: _isLoading,
+          onRetry: _loadBulletin,
+        ),
+        Expanded(child: tabView),
+      ],
+    );
+  }
+}
+
+class _OfflineCacheBanner extends StatelessWidget {
+  final String formattedTimestamp;
+  final bool isLoading;
+  final VoidCallback onRetry;
+
+  const _OfflineCacheBanner({
+    required this.formattedTimestamp,
+    required this.isLoading,
+    required this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      key: const ValueKey('offline_cache_banner'),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: AppColors.neonOrange.withValues(alpha: 0.14),
+        border: Border(
+          bottom: BorderSide(
+            color: AppColors.neonOrange.withValues(alpha: 0.45),
+          ),
+        ),
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.offline_pin_rounded,
+            size: 17,
+            color: AppColors.neonOrange,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Çevrimdışı Önbellek • Son güncelleme: $formattedTimestamp',
+              style: const TextStyle(
+                color: AppColors.neonOrange,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          TextButton.icon(
+            key: const ValueKey('offline_retry_button'),
+            onPressed: isLoading ? null : onRetry,
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.neonOrange,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              backgroundColor: AppColors.neonOrange.withValues(alpha: 0.15),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+                side: BorderSide(
+                  color: AppColors.neonOrange.withValues(alpha: 0.45),
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.refresh_rounded, size: 14),
+            label: const Text(
+              'Yenile',
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w800),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

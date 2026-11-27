@@ -22,6 +22,7 @@ from engine.models.schemas import (
 )
 from engine.predictors import (
     DEFAULT_MAX_GOALS,
+    DEFAULT_TIME_DECAY_XI,
     PredictionService,
     build_score_matrix,
     build_team_ratings,
@@ -594,9 +595,25 @@ class PredictorEngineTests(unittest.TestCase):
         played = [m for m in matches if m.status == MatchStatus.FINISHED]
         realized_home_avg = sum(int(m.home_score or 0) for m in played) / len(played)
         realized_away_avg = sum(int(m.away_score or 0) for m in played) / len(played)
+        unweighted_baseline = calculate_league_baseline(played, time_decay_xi=0.0)
+        self.assertAlmostEqual(unweighted_baseline.avg_home_goals, realized_home_avg, places=3)
+        self.assertAlmostEqual(unweighted_baseline.avg_away_goals, realized_away_avg, places=3)
+
+        max_ts = max(m.match_date.timestamp() for m in played)
+        weights = [
+            math.exp(-DEFAULT_TIME_DECAY_XI * ((max_ts - m.match_date.timestamp()) / 86400.0))
+            for m in played
+        ]
+        w_sum = sum(weights)
+        weighted_home_avg = (
+            sum(w * int(m.home_score or 0) for w, m in zip(weights, played, strict=True)) / w_sum
+        )
+        weighted_away_avg = (
+            sum(w * int(m.away_score or 0) for w, m in zip(weights, played, strict=True)) / w_sum
+        )
         baseline = calculate_league_baseline(played)
-        self.assertAlmostEqual(baseline.avg_home_goals, realized_home_avg, places=3)
-        self.assertAlmostEqual(baseline.avg_away_goals, realized_away_avg, places=3)
+        self.assertAlmostEqual(baseline.avg_home_goals, weighted_home_avg, places=3)
+        self.assertAlmostEqual(baseline.avg_away_goals, weighted_away_avg, places=3)
 
         svc_res = PredictionService().run(matches=matches, teams=teams, persist=False)
         self.assertEqual(len(svc_res.bundles), 20)

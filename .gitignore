@@ -17,9 +17,12 @@ ENV/
 # Bülten geçici / yerel önbellek ve dağıtım çıktıları
 dist/
 build/
+data/snapshots/
 engine/data/*.tmp
 engine/data/.*.tmp
 engine/data/bulletin_cache.json
+engine/data/api_cache/
+engine/data/quota_budget.json
 
 # Flutter / Mobil derleme ve imzalama çıktıları
 mobile/build/

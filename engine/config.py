@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
 from pathlib import Path
@@ -12,6 +12,20 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+
+
+def _repair_concatenated_api_keys() -> None:
+    """Satır sonu eksik `.env` girdilerinde birleşik anahtarları güvenli şekilde ayrıştırır."""
+    af_val = os.getenv("API_FOOTBALL_KEY", "").strip()
+    marker = "THE_ODDS_API_KEY="
+    if marker in af_val:
+        left, right = af_val.split(marker, 1)
+        os.environ["API_FOOTBALL_KEY"] = left.strip()
+        if not os.getenv("THE_ODDS_API_KEY", "").strip() and right.strip():
+            os.environ["THE_ODDS_API_KEY"] = right.strip()
+
+
+_repair_concatenated_api_keys()
 
 
 class LeagueId(StrEnum):
@@ -87,6 +101,20 @@ LEAGUES: dict[LeagueId, LeagueMetadata] = {
     ),
 }
 
+API_FOOTBALL_LEAGUE_IDS: dict[LeagueId, int] = {
+    LeagueId.SUPER_LIG: 203,
+    LeagueId.PREMIER_LEAGUE: 39,
+    LeagueId.LA_LIGA: 140,
+    LeagueId.LIGUE_1: 61,
+}
+
+THE_ODDS_API_SPORT_KEYS: dict[LeagueId, str] = {
+    LeagueId.SUPER_LIG: "soccer_turkey_super_league",
+    LeagueId.PREMIER_LEAGUE: "soccer_epl",
+    LeagueId.LA_LIGA: "soccer_spain_la_liga",
+    LeagueId.LIGUE_1: "soccer_france_ligue_1",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -95,9 +123,12 @@ class Settings:
     supabase_service_role_key: str
     default_season: str
     http_timeout_seconds: float
+    api_football_key: str = field(default="", repr=False)
+    the_odds_api_key: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls) -> Settings:
+        _repair_concatenated_api_keys()
         timeout_raw = os.getenv("HTTP_TIMEOUT_SECONDS", "30").strip()
         try:
             timeout = float(timeout_raw)
@@ -112,6 +143,8 @@ class Settings:
             supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
             default_season=os.getenv("DEFAULT_SEASON", "").strip() or get_current_season(),
             http_timeout_seconds=timeout,
+            api_football_key=os.getenv("API_FOOTBALL_KEY", "").strip(),
+            the_odds_api_key=os.getenv("THE_ODDS_API_KEY", "").strip(),
         )
 
     def resolve_api_key(self, use_service_role: bool = False) -> str:
