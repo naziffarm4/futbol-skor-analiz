@@ -26,13 +26,155 @@ import 'package:futbol_skor_bulteni/widgets/match_card.dart';
 import 'package:futbol_skor_bulteni/widgets/rating_comparison_bar.dart';
 import 'package:futbol_skor_bulteni/widgets/score_probability_bar.dart';
 
-String _loadRealBulletinJson() {
-  final relative = File('../engine/data/bulletin_cache.json');
-  if (relative.existsSync()) {
-    return relative.readAsStringSync(encoding: utf8);
+String _buildCiFallbackBulletinJson() {
+  Map<String, dynamic> buildLeague({
+    required String id,
+    required String name,
+    required String country,
+    required int matchId,
+    required String homeName,
+    required String homeShort,
+    required String awayName,
+    required String awayShort,
+    required String injuredPlayer,
+  }) {
+    return <String, dynamic>{
+      'id': id,
+      'name': name,
+      'country': country,
+      'season': '2026-2027',
+      'next_round': 14,
+      'played_matches_count': 110,
+      'matches_count': 1,
+      'injuries_count': 1,
+      'matches': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'id': matchId,
+          'league_id': id,
+          'round': 14,
+          'match_date': '2026-11-29T17:00:00Z',
+          'status': 'SCHEDULED',
+          'home_team': <String, dynamic>{
+            'id': matchId * 10 + 1,
+            'name': homeName,
+            'short_name': homeShort,
+          },
+          'away_team': <String, dynamic>{
+            'id': matchId * 10 + 2,
+            'name': awayName,
+            'short_name': awayShort,
+          },
+          'prediction': <String, dynamic>{
+            'id': matchId,
+            'match_id': matchId,
+            'predicted_ht_home_score': 1,
+            'predicted_ht_away_score': 0,
+            'predicted_home_score': 2,
+            'predicted_away_score': 1,
+            'ht_ft_prediction': '1/1',
+            'confidence_rate': 62.0,
+            'top_scores_json': <Map<String, dynamic>>[
+              <String, dynamic>{'score': '2-1', 'prob': 0.145},
+              <String, dynamic>{'score': '1-0', 'prob': 0.118},
+              <String, dynamic>{'score': '1-1', 'prob': 0.105},
+            ],
+          },
+          'team_analysis': <String, dynamic>{
+            'id': matchId,
+            'match_id': matchId,
+            'match_overview_text': 'İç saha hücum temposu ev sahibini öne çıkarıyor.',
+            'ht_ft_reasoning_text': 'İlk yarı ön alan baskısı 1/1 senaryosunu destekliyor.',
+            'home_analysis_text': 'Ev sahibi kenar organizasyonlarında etkili.',
+            'away_analysis_text': 'Deplasman ekibi geçiş hücumlarıyla şans arıyor.',
+            'home_offense_rating': 72.5,
+            'home_defense_rating': 68.0,
+            'away_offense_rating': 64.0,
+            'away_defense_rating': 61.5,
+          },
+          'home_injuries': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'id': matchId * 100 + 1,
+              'team_id': matchId * 10 + 1,
+              'player_name': injuredPlayer,
+              'position': 'FW',
+              'reason': 'Kas sakatlığı',
+              'return_date': '2026-12-15',
+              'impact_level': 'HIGH',
+            },
+          ],
+          'away_injuries': const <dynamic>[],
+        },
+      ],
+    };
   }
-  return File('E:/apk/futbol/engine/data/bulletin_cache.json')
-      .readAsStringSync(encoding: utf8);
+
+  return jsonEncode(<String, dynamic>{
+    'data_source': 'Transfermarkt',
+    'generated_at': '2026-11-27T18:00:00Z',
+    'season': '2026-2027',
+    'total_matches': 4,
+    'total_injuries': 4,
+    'total_played_matches': 440,
+    'leagues': <Map<String, dynamic>>[
+      buildLeague(
+        id: 'super_lig',
+        name: 'Süper Lig',
+        country: 'Turkey',
+        matchId: 1,
+        homeName: 'Galatasaray',
+        homeShort: 'GS',
+        awayName: 'Fenerbahçe',
+        awayShort: 'FB',
+        injuredPlayer: 'Mauro Icardi',
+      ),
+      buildLeague(
+        id: 'premier_league',
+        name: 'Premier League',
+        country: 'England',
+        matchId: 2,
+        homeName: 'Arsenal',
+        homeShort: 'ARS',
+        awayName: 'Liverpool',
+        awayShort: 'LIV',
+        injuredPlayer: 'Bukayo Saka',
+      ),
+      buildLeague(
+        id: 'la_liga',
+        name: 'La Liga',
+        country: 'Spain',
+        matchId: 3,
+        homeName: 'Real Madrid',
+        homeShort: 'RMA',
+        awayName: 'Barcelona',
+        awayShort: 'BAR',
+        injuredPlayer: 'Dani Carvajal',
+      ),
+      buildLeague(
+        id: 'ligue_1',
+        name: 'Ligue 1',
+        country: 'France',
+        matchId: 4,
+        homeName: 'Paris Saint-Germain',
+        homeShort: 'PSG',
+        awayName: 'Marsilya',
+        awayShort: 'OM',
+        injuredPlayer: 'Gonçalo Ramos',
+      ),
+    ],
+  });
+}
+
+String _loadRealBulletinJson() {
+  for (final path in <String>[
+    '../engine/data/bulletin_cache.json',
+    'E:/apk/futbol/engine/data/bulletin_cache.json',
+  ]) {
+    final file = File(path);
+    if (file.existsSync()) {
+      return file.readAsStringSync(encoding: utf8);
+    }
+  }
+  return _buildCiFallbackBulletinJson();
 }
 
 BulletinApiService _createSuccessService(List<int> bodyBytes) {
